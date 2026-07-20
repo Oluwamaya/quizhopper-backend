@@ -4,6 +4,7 @@ import { Quiz } from '../models/Quiz';
 import { User } from '../models/User';
 import { getGlobalConfig } from '../models/AppConfig';
 import { GameSession } from '../models/GameSession';
+import { WalletTransaction } from '../models/WalletTransaction';
 import { setRoomCache, getRoomCache, delRoomCache } from '../services/redisService';
 
 const JWT_SECRET = process.env.JWT_SECRET || 'super_secret_jwt_key_quizhopper_2026';
@@ -92,6 +93,14 @@ export const setupGameSockets = (io: Server) => {
         if (coinCost > 0) {
           user.coins -= coinCost;
           await user.save();
+          await WalletTransaction.create({
+            user: socket.userId,
+            type: 'host_game',
+            coinsChange: -coinCost,
+            amountMoney: 0,
+            description: `Hosted game session for "${quiz.title}" (${playerLimit} players)`,
+            status: 'completed'
+          });
         }
 
         // Create the session

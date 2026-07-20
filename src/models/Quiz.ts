@@ -13,6 +13,7 @@ export interface IQuiz extends Document {
   creator?: Schema.Types.ObjectId | string; // Reference to User. If null, it's a default system quiz
   questions: IQuestion[];
   price: number;                            // Price in USD ($0 for free/default)
+  priceCoins: number;                       // Price in Coins (0 for free, max 10)
   isPublishedToMarketplace: boolean;
   isDefault: boolean;                       // True for Current Affairs, Software Dev testing quizzes
   createdAt: Date;
@@ -31,6 +32,7 @@ const QuizSchema = new Schema<IQuiz>({
   creator: { type: Schema.Types.ObjectId, ref: 'User' },
   questions: [QuestionSchema],
   price: { type: Number, default: 0 },
+  priceCoins: { type: Number, default: 0, max: 10 },
   isPublishedToMarketplace: { type: Boolean, default: false },
   isDefault: { type: Boolean, default: false },
   createdAt: { type: Date, default: Date.now }

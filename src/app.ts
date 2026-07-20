@@ -23,6 +23,7 @@ import purchaseRoutes from './routes/purchaseRoutes';
 import gameRoutes from './routes/gameRoutes';
 import adminRoutes from './routes/adminRoutes';
 import supportRoutes from './routes/supportRoutes';
+import paystackRoutes from './routes/paystackRoutes';
 
 // Import socket setup
 import { setupGameSockets } from './sockets/gameSocket';
@@ -97,6 +98,7 @@ app.use('/api/purchases', purchaseRoutes);
 app.use('/api/games', gameRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/support', supportRoutes);
+app.use('/api/wallet/paystack', paystackRoutes);
 
 // Health check endpoint
 app.get('/health', (req, res) => {

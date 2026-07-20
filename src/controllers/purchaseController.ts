@@ -2,10 +2,11 @@ import { Response } from 'express';
 import { Quiz } from '../models/Quiz';
 import { QuizPurchase } from '../models/QuizPurchase';
 import { User } from '../models/User';
+import { WalletTransaction } from '../models/WalletTransaction';
 import { getGlobalConfig } from '../models/AppConfig';
 import { AuthRequest } from '../middlewares/authMiddleware';
 
-// Purchase a quiz (Mock Stripe Payment callback/endpoint)
+// Purchase a quiz using Coins
 export const purchaseQuiz = async (req: AuthRequest, res: Response) => {
   try {
     const { quizId } = req.body;
@@ -31,31 +32,66 @@ export const purchaseQuiz = async (req: AuthRequest, res: Response) => {
       return res.status(400).json({ success: false, message: 'You have already purchased this quiz' });
     }
 
+    const config = await getGlobalConfig();
+    const costInCoins = quiz.priceCoins > 0 ? quiz.priceCoins : (config.quizPriceCoins || 5);
+
+    const buyer = await User.findById(buyerId);
+    if (!buyer) {
+      return res.status(404).json({ success: false, message: 'Buyer user account not found' });
+    }
+
+    if (buyer.coins < costInCoins) {
+      return res.status(400).json({
+        success: false,
+        message: `Insufficient coins. You need ${costInCoins} coins to unlock this quiz. Current coins: ${buyer.coins}`
+      });
+    }
+
+    // Deduct coins from buyer
+    buyer.coins -= costInCoins;
+    await buyer.save();
+
+    // Log buyer coin deduction
+    await WalletTransaction.create({
+      user: buyerId,
+      type: 'marketplace_buy',
+      coinsChange: -costInCoins,
+      amountMoney: 0,
+      description: `Unlocked quiz deck "${quiz.title}"`,
+      status: 'completed'
+    });
+
     // 3. Create the purchase transaction
     const purchase = await QuizPurchase.create({
       buyer: buyerId,
       quiz: quizId,
-      pricePaid: quiz.price
+      pricePaid: costInCoins
     });
 
-    // 4. Distribute earnings dynamically based on the current platform commission config
-    if (quiz.creator && quiz.price > 0) {
-      const config = await getGlobalConfig();
-      const commissionMultiplier = 1 - config.commissionRate; // e.g. 1 - 0.15 = 0.85
-      const sellerEarnings = Number((quiz.price * commissionMultiplier).toFixed(2));
-
+    // 4. Distribute seller coin earnings
+    if (quiz.creator) {
+      const sellerEarn = config.sellerCoinShare !== undefined ? config.sellerCoinShare : 3;
       await User.findByIdAndUpdate(quiz.creator, {
         $inc: {
-          balance: sellerEarnings,
+          coins: sellerEarn,
           salesCount: 1
         }
+      });
+      await WalletTransaction.create({
+        user: quiz.creator,
+        type: 'marketplace_sale',
+        coinsChange: sellerEarn,
+        amountMoney: 0,
+        description: `Marketplace sale credit for "${quiz.title}"`,
+        status: 'completed'
       });
     }
 
     return res.status(201).json({
       success: true,
-      message: 'Quiz purchased successfully',
-      purchase
+      message: 'Quiz unlocked successfully!',
+      purchase,
+      remainingCoins: buyer.coins
     });
   } catch (error: any) {
     return res.status(500).json({ success: false, message: error.message });
@@ -162,11 +198,20 @@ export const withdrawEarnings = async (req: AuthRequest, res: Response) => {
     seller.balance = Number((seller.balance - amount).toFixed(2));
     await seller.save();
 
-    console.log(`WITHDRAWAL PROCESSED: $${amount} paid out to seller ${seller.email}`);
+    await WalletTransaction.create({
+      user: userId,
+      type: 'withdrawal',
+      amountMoney: -amount,
+      coinsChange: 0,
+      description: `Naira Bank Payout Withdrawal (₦ ${amount.toLocaleString()})`,
+      status: 'completed'
+    });
+
+    console.log(`WITHDRAWAL PROCESSED: ₦ ${amount} paid out to seller ${seller.email}`);
 
     return res.status(200).json({
       success: true,
-      message: `Withdrawal of $${amount.toFixed(2)} processed successfully!`,
+      message: `Withdrawal of ₦ ${amount.toLocaleString()} processed successfully!`,
       newBalance: seller.balance
     });
   } catch (error: any) {

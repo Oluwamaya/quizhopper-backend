@@ -3,6 +3,7 @@ import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import crypto from 'crypto';
 import { User } from '../models/User';
+import { WalletTransaction } from '../models/WalletTransaction';
 import { getGlobalConfig } from '../models/AppConfig';
 import { registerSubscription } from '../services/pushService';
 import { AuthRequest } from '../middlewares/authMiddleware';
@@ -460,13 +461,23 @@ export const buyCoins = async (req: AuthRequest, res: Response) => {
     if (user.balance < totalCost) {
       return res.status(400).json({
         success: false,
-        message: `Insufficient balance. You need $${totalCost.toFixed(2)} to purchase ${amount} coins. Current balance: $${user.balance.toFixed(2)}`
+        message: `Insufficient wallet balance. You need ₦ ${totalCost.toLocaleString()} to purchase ${amount} coins. Current balance: ₦ ${user.balance.toLocaleString()}`
       });
     }
 
     user.balance -= totalCost;
     user.coins = (user.coins || 0) + amount;
     await user.save();
+
+    // Log Wallet Transaction
+    await WalletTransaction.create({
+      user: user._id,
+      type: 'buy_coins',
+      amountMoney: -totalCost,
+      coinsChange: amount,
+      description: `Purchased ${amount} Hosting Coins (₦ ${totalCost.toLocaleString()})`,
+      status: 'completed'
+    });
 
     return res.status(200).json({
       success: true,

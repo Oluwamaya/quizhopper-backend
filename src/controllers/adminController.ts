@@ -19,7 +19,7 @@ export const getAdminConfig = async (req: AuthRequest, res: Response) => {
 // Update global system configuration (commission rate, player limit)
 export const updateAdminConfig = async (req: AuthRequest, res: Response) => {
   try {
-    const { commissionRate, freeTierLimit, coinPrice } = req.body;
+    const { commissionRate, freeTierLimit, coinPrice, quizPriceCoins, sellerCoinShare, platformCoinFee } = req.body;
     const config = await getGlobalConfig();
 
     if (commissionRate !== undefined) {
@@ -38,9 +38,30 @@ export const updateAdminConfig = async (req: AuthRequest, res: Response) => {
 
     if (coinPrice !== undefined) {
       if (coinPrice <= 0) {
-        return res.status(400).json({ success: false, message: 'Coin exchange rate must be greater than $0.00' });
+        return res.status(400).json({ success: false, message: 'Coin exchange rate must be greater than 0' });
       }
       config.coinPrice = coinPrice;
+    }
+
+    if (quizPriceCoins !== undefined) {
+      if (quizPriceCoins < 0 || quizPriceCoins > 10) {
+        return res.status(400).json({ success: false, message: 'Default quiz price must be between 0 and 10 coins' });
+      }
+      config.quizPriceCoins = quizPriceCoins;
+    }
+
+    if (sellerCoinShare !== undefined) {
+      if (sellerCoinShare < 0) {
+        return res.status(400).json({ success: false, message: 'Seller coin share must be 0 or greater' });
+      }
+      config.sellerCoinShare = sellerCoinShare;
+    }
+
+    if (platformCoinFee !== undefined) {
+      if (platformCoinFee < 0) {
+        return res.status(400).json({ success: false, message: 'Platform coin fee must be 0 or greater' });
+      }
+      config.platformCoinFee = platformCoinFee;
     }
 
     config.updatedAt = new Date();
