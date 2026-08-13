@@ -2,14 +2,19 @@ import express from 'express';
 import http from 'http';
 import { Server } from 'socket.io';
 import cors from 'cors';
-import dotenv from 'dotenv';
 import passport from 'passport';
 import cookieSession from 'cookie-session';
+import helmet from 'helmet';
+import compression from 'compression';
+import morgan from 'morgan';
+import mongoSanitize from 'express-mongo-sanitize';
+import hpp from 'hpp';
+import mongoose from 'mongoose';
+import { env } from './config/env';
 import { connectDB } from './config/db';
 import { startSessionCleanupCron } from './services/cronService';
-
-// Load environmental config
-dotenv.config();
+import { generalApiLimiter } from './middlewares/rateLimiters';
+import { notFoundHandler, errorHandler } from './middlewares/errorHandler';
 
 // Initialize passport config
 import './config/passport';
@@ -32,10 +37,19 @@ import { setupSupportSockets } from './sockets/supportSocket';
 const app = express();
 const server = http.createServer(app);
 
+// Shared CORS origin check — allow any origin in the configured allow-list,
+// plus non-browser/same-origin requests (no Origin header).
+const corsOriginCheck = (origin: string | undefined, callback: (err: Error | null, allow?: boolean) => void) => {
+  if (!origin || env.CLIENT_URLS.includes(origin)) {
+    return callback(null, true);
+  }
+  return callback(new Error('Not allowed by CORS'));
+};
+
 // Configure Sockets with CORS
 const io = new Server(server, {
   cors: {
-    origin: process.env.CLIENT_URL || 'http://localhost:5173',
+    origin: corsOriginCheck,
     methods: ['GET', 'POST'],
     credentials: true
   }
@@ -44,22 +58,52 @@ const io = new Server(server, {
 // Bind socketio instance to Express App so controllers can access it
 app.set('socketio', io);
 
-const PORT = process.env.PORT || 5000;
-const CLIENT_URL = process.env.CLIENT_URL || 'http://localhost:5173';
-const COOKIE_KEY = process.env.COOKIE_KEY || 'quizhopper_cookie_session_key_secret';
+// Trust the first proxy hop (required for correct client IPs behind a
+// load balancer/reverse proxy — rate limiting and secure cookies depend on it)
+app.set('trust proxy', 1);
 
 // Connect to MongoDB database
 connectDB();
 
-// Middlewares
+// Security headers. This is a JSON API (not server-rendered HTML), and the
+// frontend on a separate origin loads /uploads images directly, so relax the
+// cross-origin-resource-policy default and skip CSP (irrelevant for JSON/API
+// responses and would otherwise need per-frontend tuning).
+app.use(
+  helmet({
+    contentSecurityPolicy: false,
+    crossOriginResourcePolicy: { policy: 'cross-origin' }
+  })
+);
+
+// Response compression
+app.use(compression());
+
+// HTTP request logging
+app.use(morgan(env.isProduction ? 'combined' : 'dev'));
+
 app.use(
   cors({
-    origin: CLIENT_URL,
+    origin: corsOriginCheck,
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS']
   })
 );
-app.use(express.json());
+
+// Explicit body size limit. Base64 encoding inflates binary size by ~33%,
+// and /support/upload allows files up to 5MB, so the limit needs headroom
+// above that — bounded well below "unlimited" to prevent memory-exhaustion
+// DoS via huge payloads. `verify` stashes the raw bytes so the Paystack
+// webhook can HMAC the exact payload Paystack signed — re-serializing the
+// parsed JSON can reorder/reformat it and break signature verification.
+app.use(
+  express.json({
+    limit: '9mb',
+    verify: (req: any, _res, buf) => {
+      req.rawBody = buf;
+    }
+  })
+);
 
 // Custom cookie-parser middleware to parse req.cookies without extra packages
 app.use((req: any, res, next) => {
@@ -76,17 +120,29 @@ app.use((req: any, res, next) => {
   next();
 });
 
+// Strip any Mongo query operators ($, .) from user input to prevent NoSQL injection
+app.use(mongoSanitize());
+
+// Guard against HTTP Parameter Pollution (duplicate query keys)
+app.use(hpp());
+
 // Configure Session middleware (Required for Google Auth redirect state verification)
 app.use(
   cookieSession({
     name: 'session',
-    keys: [COOKIE_KEY],
-    maxAge: 24 * 60 * 60 * 1000 // 24 hours
+    keys: [env.COOKIE_KEY],
+    maxAge: 24 * 60 * 60 * 1000, // 24 hours
+    secure: env.isProduction,
+    sameSite: 'lax'
   })
 );
 
 app.use(passport.initialize());
 app.use(passport.session());
+
+// Global rate limit across the whole API surface (tighter, route-specific
+// limiters are applied on top of this for sensitive endpoints)
+app.use('/api', generalApiLimiter);
 
 // Serve static uploaded complaint attachments
 app.use('/uploads', express.static(path.join(__dirname, '../public/uploads')));
@@ -105,6 +161,10 @@ app.get('/health', (req, res) => {
   res.status(200).json({ status: 'ok', time: new Date() });
 });
 
+// 404 + centralized error handling (must be mounted last)
+app.use(notFoundHandler);
+app.use(errorHandler);
+
 // Configure Socket.io handlers
 setupGameSockets(io);
 setupSupportSockets(io);
@@ -113,6 +173,28 @@ setupSupportSockets(io);
 startSessionCleanupCron(io);
 
 // Start server
-server.listen(PORT, () => {
-  console.log(`Quiz Hopper server running in ${process.env.NODE_ENV} mode on port ${PORT}`);
+server.listen(env.PORT, () => {
+  console.log(`Quiz Hopper server running in ${env.NODE_ENV} mode on port ${env.PORT}`);
 });
+
+// Graceful shutdown — stop accepting new connections and close DB/IO cleanly
+const shutdown = (signal: string) => {
+  console.log(`${signal} received. Shutting down gracefully...`);
+  server.close(async () => {
+    console.log('HTTP server closed.');
+    try {
+      await mongoose.connection.close();
+      console.log('MongoDB connection closed.');
+    } catch (err) {
+      console.error('Error closing MongoDB connection:', err);
+    } finally {
+      process.exit(0);
+    }
+  });
+
+  // Force-exit if shutdown hangs
+  setTimeout(() => process.exit(1), 10000).unref();
+};
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));

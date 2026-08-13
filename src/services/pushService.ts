@@ -1,12 +1,10 @@
 import webpush from 'web-push';
 import { User } from '../models/User';
-import dotenv from 'dotenv';
+import { env } from '../config/env';
 
-dotenv.config();
-
-const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY || '';
-const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || '';
-const VAPID_EMAIL = process.env.VAPID_EMAIL || 'mailto:admin@quizhopper.com';
+const VAPID_PUBLIC_KEY = env.VAPID_PUBLIC_KEY;
+const VAPID_PRIVATE_KEY = env.VAPID_PRIVATE_KEY;
+const VAPID_EMAIL = env.VAPID_EMAIL;
 
 // Initialize web-push if keys are provided
 if (VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY) {

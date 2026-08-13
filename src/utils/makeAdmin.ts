@@ -1,10 +1,6 @@
 import mongoose from 'mongoose';
-import dotenv from 'dotenv';
 import { User } from '../models/User';
-
-dotenv.config();
-
-const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/quizhopper';
+import { env } from '../config/env';
 
 const makeAdmin = async () => {
   const email = process.argv[2];
@@ -14,7 +10,7 @@ const makeAdmin = async () => {
   }
 
   try {
-    await mongoose.connect(MONGODB_URI);
+    await mongoose.connect(env.MONGODB_URI);
     console.log('Connected to MongoDB database.');
 
     const user = await User.findOne({ email: email.toLowerCase().trim() });

@@ -5,9 +5,10 @@ import { User } from '../models/User';
 import { getGlobalConfig } from '../models/AppConfig';
 import { GameSession } from '../models/GameSession';
 import { WalletTransaction } from '../models/WalletTransaction';
-import { setRoomCache, getRoomCache, delRoomCache } from '../services/redisService';
+import { setRoomCache, getRoomCache, delRoomCache, withRoomLock } from '../services/redisService';
+import { env } from '../config/env';
 
-const JWT_SECRET = process.env.JWT_SECRET || 'super_secret_jwt_key_quizhopper_2026';
+const JWT_SECRET = env.JWT_SECRET;
 
 interface AuthenticatedSocket extends Socket {
   userId?: string;
@@ -52,33 +53,26 @@ export const setupGameSockets = (io: Server) => {
 
         // Fetch system configurations
         const config = await getGlobalConfig();
-        let playerLimit = config.freeTierLimit || 10;
+        const freeTierLimit = config.freeTierLimit || 5;
+        const extraPlayerCoinCost = config.extraPlayerCoinCost || 2;
+
+        let playerLimit = freeTierLimit;
         let coinCost = 0;
 
-        if (playerLimitTier) {
-          if (playerLimitTier === 20) {
-            playerLimit = 20;
-            coinCost = 3;
-          } else if (playerLimitTier === 30) {
-            playerLimit = 30;
-            coinCost = 5;
-          } else if (playerLimitTier === 50) {
-            playerLimit = 50;
-            coinCost = 8;
-          } else if (playerLimitTier === 100) {
-            playerLimit = 100;
-            coinCost = 15;
-          }
+        // Any capacity above the free tier costs coins linearly, not just a fixed set of presets
+        if (playerLimitTier && Number.isFinite(playerLimitTier) && playerLimitTier > freeTierLimit) {
+          playerLimit = Math.min(1000, Math.floor(playerLimitTier));
+          coinCost = (playerLimit - freeTierLimit) * extraPlayerCoinCost;
         }
 
         // Find user and check coins
-        const user = await User.findById(socket.userId);
-        if (!user) {
+        const userPreview = await User.findById(socket.userId);
+        if (!userPreview) {
           return socket.emit('error', { message: 'Host account not found' });
         }
 
-        if (user.coins < coinCost) {
-          return socket.emit('error', { message: `Insufficient coins. This tier requires ${coinCost} coins. Your current balance is ${user.coins} coins.` });
+        if (userPreview.coins < coinCost) {
+          return socket.emit('error', { message: `Insufficient coins. This tier requires ${coinCost} coins. Your current balance is ${userPreview.coins} coins.` });
         }
 
         // Generate a unique 6-digit Game Pin
@@ -89,10 +83,20 @@ export const setupGameSockets = (io: Server) => {
           existingSession = await GameSession.findOne({ gamePin, state: { $ne: 'FINISHED' } });
         }
 
-        // Deduct coins if cost is greater than 0
+        // Deduct coins if cost is greater than 0. Atomic conditional update
+        // (coins >= coinCost in the filter) so two lobbies created back to
+        // back can't both pass a stale coin check and double-spend.
+        let user = userPreview;
         if (coinCost > 0) {
-          user.coins -= coinCost;
-          await user.save();
+          const deducted = await User.findOneAndUpdate(
+            { _id: socket.userId, coins: { $gte: coinCost } },
+            { $inc: { coins: -coinCost } },
+            { new: true }
+          );
+          if (!deducted) {
+            return socket.emit('error', { message: `Insufficient coins. This tier requires ${coinCost} coins.` });
+          }
+          user = deducted;
           await WalletTransaction.create({
             user: socket.userId,
             type: 'host_game',
@@ -347,53 +351,70 @@ export const setupGameSockets = (io: Server) => {
           return socket.emit('error', { message: 'Pin, Nickname, and Avatar are required' });
         }
 
-        let session = await getRoomCache(gamePin);
-        if (!session) {
-          const dbSession = await GameSession.findOne({ gamePin, state: 'LOBBY' });
-          if (dbSession) {
-            session = dbSession.toObject();
+        // The read-check-modify-write below must be atomic per room: without the
+        // lock, two players joining in the same instant could both read the same
+        // pre-join state and each write their own version back, silently dropping
+        // whichever player's update got overwritten (and letting the room exceed
+        // its player cap, since both reads would see it as not-yet-full).
+        const result = await withRoomLock(gamePin, async () => {
+          let session = await getRoomCache(gamePin);
+          if (!session) {
+            const dbSession = await GameSession.findOne({ gamePin, state: 'LOBBY' });
+            if (dbSession) {
+              session = dbSession.toObject();
+            }
           }
+
+          if (!session || session.state !== 'LOBBY') {
+            return { status: 'error' as const, message: 'Active game lobby not found. Check the Game Pin.' };
+          }
+
+          // Verify nickname is unique in this room
+          const nameExists = session.players.some((p: any) => p.nickname.toLowerCase() === nickname.trim().toLowerCase());
+          if (nameExists) {
+            return { status: 'join_failed' as const, message: 'Nickname is already taken. Try another!' };
+          }
+
+          // Check player count against host's playerLimit tier
+          const limit = session.playerLimit || 10;
+          if (session.players.length >= limit) {
+            return { status: 'join_failed' as const, message: `This game lobby is full! The maximum cap for this session is ${limit} players.` };
+          }
+
+          const newPlayer = {
+            socketId: socket.id,
+            nickname: nickname.trim(),
+            avatar,
+            score: 0,
+            answers: [],
+            joinedAt: new Date()
+          };
+
+          session.players.push(newPlayer);
+
+          // Update MongoDB in background
+          GameSession.findByIdAndUpdate(session._id, {
+            $push: { players: newPlayer }
+          }).catch((err: any) => console.error('DB Update error:', err));
+
+          // Update Cache
+          await setRoomCache(gamePin, session);
+
+          return { status: 'ok' as const, newPlayer, players: session.players };
+        });
+
+        if (result.status === 'error') {
+          return socket.emit('error', { message: result.message });
+        }
+        if (result.status === 'join_failed') {
+          return socket.emit('join_failed', { message: result.message });
         }
 
-        if (!session || session.state !== 'LOBBY') {
-          return socket.emit('error', { message: 'Active game lobby not found. Check the Game Pin.' });
-        }
-
-        // Verify nickname is unique in this room
-        const nameExists = session.players.some((p: any) => p.nickname.toLowerCase() === nickname.trim().toLowerCase());
-        if (nameExists) {
-          return socket.emit('join_failed', { message: 'Nickname is already taken. Try another!' });
-        }
-
-        // Check player count against host's playerLimit tier
-        const limit = session.playerLimit || 10;
-        if (session.players.length >= limit) {
-          return socket.emit('join_failed', { message: `This game lobby is full! The maximum cap for this session is ${limit} players.` });
-        }
-
-        const newPlayer = {
-          socketId: socket.id,
-          nickname: nickname.trim(),
-          avatar,
-          score: 0,
-          answers: [],
-          joinedAt: new Date()
-        };
-
-        session.players.push(newPlayer);
-
-        // Update MongoDB in background
-        GameSession.findByIdAndUpdate(session._id, {
-          $push: { players: newPlayer }
-        }).catch(err => console.error('DB Update error:', err));
-
-        // Update Cache
-        await setRoomCache(gamePin, session);
-
+        const { newPlayer, players } = result;
         socket.join(`room:${gamePin}`);
         console.log(`Player ${nickname} joined room:${gamePin}`);
 
-        const playersList = session.players.map((p: any) => ({
+        const playersList = players.map((p: any) => ({
           nickname: p.nickname,
           avatar: p.avatar
         }));

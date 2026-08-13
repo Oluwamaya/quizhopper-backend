@@ -1,9 +1,8 @@
 import { Router } from 'express';
-import { 
-  purchaseQuiz, 
-  getSellerDashboard, 
-  getPurchaseHistory,
-  withdrawEarnings
+import {
+  purchaseQuiz,
+  getSellerDashboard,
+  getPurchaseHistory
 } from '../controllers/purchaseController';
 import { protect } from '../middlewares/authMiddleware';
 
@@ -14,9 +13,6 @@ router.post('/', protect, purchaseQuiz);
 
 // Get Seller Dashboard stats and transaction history
 router.get('/seller/dashboard', protect, getSellerDashboard);
-
-// Process seller payout withdrawal
-router.post('/seller/withdraw', protect, withdrawEarnings);
 
 // Get User's buyer purchase history
 router.get('/history', protect, getPurchaseHistory);

@@ -1,7 +1,8 @@
 import { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
+import { env } from '../config/env';
 
-const JWT_SECRET = process.env.JWT_SECRET || 'super_secret_jwt_key_quizhopper_2026';
+const JWT_SECRET = env.JWT_SECRET;
 
 // Extend Request interface to include userId and userEmail
 export interface AuthRequest extends Request {

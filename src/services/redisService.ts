@@ -1,4 +1,5 @@
 import Redis from 'ioredis';
+import { env } from '../config/env';
 
 let redisClient: Redis | null = null;
 let isRedisConnected = false;
@@ -10,8 +11,8 @@ const localCache = new Map<string, any>();
 try {
   // Configured with quick timeout (1.5 seconds) so it doesn't hang the process if Redis is missing
   redisClient = new Redis({
-    host: process.env.REDIS_HOST || '127.0.0.1',
-    port: Number(process.env.REDIS_PORT) || 6379,
+    host: env.REDIS_HOST,
+    port: env.REDIS_PORT,
     connectTimeout: 1500,
     maxRetriesPerRequest: 1
   });
@@ -67,5 +68,31 @@ export const delRoomCache = async (gamePin: string): Promise<void> => {
     }
   } catch (err) {
     localCache.delete(gamePin);
+  }
+};
+
+// Per-room mutex: getRoomCache/setRoomCache are separate read-then-write calls, so two
+// socket handlers racing on the same gamePin (e.g. two players joining in the same
+// instant) could both read the pre-update state and overwrite each other's change —
+// silently dropping a joining player, not just letting the room exceed its cap.
+// This serializes read-modify-write sections per room within this process.
+const roomLocks = new Map<string, Promise<void>>();
+
+export const withRoomLock = async <T>(gamePin: string, fn: () => Promise<T>): Promise<T> => {
+  const previous = roomLocks.get(gamePin) || Promise.resolve();
+
+  let releaseNext: () => void;
+  const next = new Promise<void>((resolve) => { releaseNext = resolve; });
+  roomLocks.set(gamePin, next);
+
+  await previous;
+  try {
+    return await fn();
+  } finally {
+    releaseNext!();
+    // Only clear the entry if nobody queued a newer lock behind us while we ran
+    if (roomLocks.get(gamePin) === next) {
+      roomLocks.delete(gamePin);
+    }
   }
 };

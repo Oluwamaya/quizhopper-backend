@@ -34,11 +34,13 @@ const PushSubscriptionSchema = new Schema<IPushSubscription>({
 });
 
 const UserSchema = new Schema<IUser>({
-  displayName: { type: String, required: true },
-  email: { type: String, required: true, unique: true },
-  avatarUrl: { type: String },
+  displayName: { type: String, required: true, maxlength: 32 },
+  email: { type: String, required: true, unique: true, maxlength: 254 },
+  avatarUrl: { type: String, maxlength: 1000 },
   googleId: { type: String, unique: true, sparse: true },
-  password: { type: String },
+  // select: false — password hash is never returned by default; controllers
+  // that need it explicitly call .select('+password').
+  password: { type: String, select: false },
   isPremium: { type: Boolean, default: false },
   isAdmin: { type: Boolean, default: false },
   balance: { type: Number, default: 0 },

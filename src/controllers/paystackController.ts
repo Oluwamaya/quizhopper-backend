@@ -3,9 +3,10 @@ import crypto from 'crypto';
 import { User } from '../models/User';
 import { WalletTransaction } from '../models/WalletTransaction';
 import { AuthRequest } from '../middlewares/authMiddleware';
+import { env } from '../config/env';
 
-const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY || 'sk_test_5ba1a646c24be800e238053a61fbc3f698e858db';
-const PAYSTACK_PUBLIC_KEY = process.env.PAYSTACK_PUBLIC_KEY || 'pk_test_3923d38692ca3484f479a838be813d11b228aa41';
+const PAYSTACK_SECRET_KEY = env.PAYSTACK_SECRET_KEY;
+const PAYSTACK_PUBLIC_KEY = env.PAYSTACK_PUBLIC_KEY;
 
 // Set of processed reference IDs to prevent duplicate credits
 const processedReferences = new Set<string>();
@@ -16,8 +17,8 @@ export const initializePaystackDeposit = async (req: AuthRequest, res: Response)
     const { amount } = req.body;
     const userId = req.userId;
 
-    if (!amount || typeof amount !== 'number' || amount < 100) {
-      return res.status(400).json({ success: false, message: 'Minimum deposit amount is ₦ 100' });
+    if (!amount || typeof amount !== 'number' || !Number.isFinite(amount) || amount < 100 || amount > 5000000) {
+      return res.status(400).json({ success: false, message: 'Deposit amount must be between ₦ 100 and ₦ 5,000,000' });
     }
 
     const user = await User.findById(userId);
@@ -83,7 +84,7 @@ export const verifyPaystackDeposit = async (req: AuthRequest, res: Response) => 
     const { reference } = req.params;
     const userId = req.userId;
 
-    if (!reference) {
+    if (!reference || typeof reference !== 'string') {
       return res.status(400).json({ success: false, message: 'Transaction reference is required' });
     }
 
@@ -103,47 +104,76 @@ export const verifyPaystackDeposit = async (req: AuthRequest, res: Response) => 
       });
     }
 
-    // Call Paystack verify API
-    let verifiedAmountNaira = 0;
+    if (!PAYSTACK_SECRET_KEY) {
+      return res.status(503).json({ success: false, message: 'Payment provider is not configured. Please contact support.' });
+    }
+
+    // Call Paystack verify API. There is no safe fallback here — if this
+    // call fails or the transaction isn't confirmed successful, the deposit
+    // must NOT be credited. Crediting on failure would let anyone mint
+    // wallet balance for free with a bogus reference.
+    let verifyData: any;
     try {
-      const response = await fetch(`https://api.paystack.co/transaction/verify/${reference}`, {
+      const response = await fetch(`https://api.paystack.co/transaction/verify/${encodeURIComponent(reference)}`, {
         method: 'GET',
         headers: {
           'Authorization': `Bearer ${PAYSTACK_SECRET_KEY}`
         }
       });
-      const data: any = await response.json();
-      if (data.status && data.data.status === 'success') {
-        verifiedAmountNaira = data.data.amount / 100;
-      }
+      verifyData = await response.json();
     } catch (e) {
-      console.warn('Paystack verify API fallback (Dev mode active)');
+      return res.status(502).json({ success: false, message: 'Unable to reach payment provider. Please try again shortly.' });
     }
 
-    // Fallback amount parsing if dev key test reference is used
-    if (verifiedAmountNaira <= 0) {
-      verifiedAmountNaira = 2000; // default top-up amount
+    if (!verifyData?.status || verifyData.data?.status !== 'success') {
+      return res.status(400).json({ success: false, message: 'Payment was not successful or could not be verified.' });
+    }
+
+    const verifiedAmountNaira = Number(verifyData.data.amount) / 100;
+    if (!Number.isFinite(verifiedAmountNaira) || verifiedAmountNaira <= 0) {
+      return res.status(400).json({ success: false, message: 'Payment amount could not be verified.' });
+    }
+
+    // Ensure the transaction actually belongs to the requesting user, so a
+    // reference cannot be replayed by a different account to steal a
+    // deposit meant for someone else.
+    const transactionOwnerId = verifyData.data.metadata?.userId;
+    if (transactionOwnerId && transactionOwnerId !== userId) {
+      return res.status(403).json({ success: false, message: 'This transaction does not belong to your account.' });
     }
 
     processedReferences.add(reference);
 
-    // Credit user balance
-    const updatedUser = await User.findByIdAndUpdate(
-      userId,
-      { $inc: { balance: verifiedAmountNaira } },
-      { new: true }
-    );
+    // Record the ledger entry first — `reference` has a unique index, so a
+    // duplicate-credit race is rejected here at the database layer even if
+    // the in-memory idempotency set were ever bypassed (e.g. process
+    // restart). Only credit the balance once the ledger write succeeds.
+    try {
+      await WalletTransaction.create({
+        user: userId,
+        type: 'deposit',
+        amountMoney: verifiedAmountNaira,
+        coinsChange: 0,
+        description: 'Paystack Wallet Deposit (Naira)',
+        reference,
+        status: 'completed'
+      });
+    } catch (err: any) {
+      if (err.code === 11000) {
+        const user = await User.findById(userId);
+        return res.status(200).json({
+          success: true,
+          message: 'Transaction already verified and credited',
+          amountCredited: 0,
+          user: user
+            ? { id: user._id, displayName: user.displayName, email: user.email, balance: user.balance, coins: user.coins }
+            : undefined
+        });
+      }
+      throw err;
+    }
 
-    // Log Wallet Transaction
-    await WalletTransaction.create({
-      user: userId,
-      type: 'deposit',
-      amountMoney: verifiedAmountNaira,
-      coinsChange: 0,
-      description: 'Paystack Wallet Deposit (Naira)',
-      reference,
-      status: 'completed'
-    });
+    const updatedUser = await User.findByIdAndUpdate(userId, { $inc: { balance: verifiedAmountNaira } }, { new: true });
 
     return res.status(200).json({
       success: true,
@@ -165,36 +195,56 @@ export const verifyPaystackDeposit = async (req: AuthRequest, res: Response) => 
 // 3. Webhook listener for automatic background verification
 export const handlePaystackWebhook = async (req: Request, res: Response) => {
   try {
-    const signature = req.headers['x-paystack-signature'];
-    if (signature) {
-      const hash = crypto.createHmac('sha512', PAYSTACK_SECRET_KEY)
-        .update(JSON.stringify(req.body))
-        .digest('hex');
+    if (!PAYSTACK_SECRET_KEY) {
+      return res.status(503).send('Payment provider is not configured');
+    }
 
-      if (hash !== signature) {
-        return res.status(400).send('Invalid signature');
-      }
+    // The signature header is mandatory, not optional — without this check
+    // anyone could POST a fake charge.success event and credit any wallet.
+    const signature = req.headers['x-paystack-signature'];
+    if (!signature || typeof signature !== 'string') {
+      return res.status(400).send('Missing signature');
+    }
+
+    const rawBody: Buffer | undefined = (req as any).rawBody;
+    if (!rawBody) {
+      return res.status(400).send('Missing request body');
+    }
+
+    const expectedHash = crypto.createHmac('sha512', PAYSTACK_SECRET_KEY).update(rawBody).digest('hex');
+
+    const signatureBuffer = Buffer.from(signature, 'utf8');
+    const expectedBuffer = Buffer.from(expectedHash, 'utf8');
+    const isValidSignature =
+      signatureBuffer.length === expectedBuffer.length && crypto.timingSafeEqual(signatureBuffer, expectedBuffer);
+
+    if (!isValidSignature) {
+      return res.status(400).send('Invalid signature');
     }
 
     const event = req.body;
     if (event && event.event === 'charge.success') {
       const ref = event.data.reference;
       const userId = event.data.metadata?.userId;
-      const amountNaira = event.data.amount / 100;
+      const amountNaira = Number(event.data.amount) / 100;
 
-      if (ref && userId && !processedReferences.has(ref)) {
+      if (ref && userId && Number.isFinite(amountNaira) && amountNaira > 0 && !processedReferences.has(ref)) {
         processedReferences.add(ref);
-        await User.findByIdAndUpdate(userId, { $inc: { balance: amountNaira } });
-        await WalletTransaction.create({
-          user: userId,
-          type: 'deposit',
-          amountMoney: amountNaira,
-          coinsChange: 0,
-          description: 'Paystack Direct Webhook Deposit',
-          reference: ref,
-          status: 'completed'
-        });
-        console.log(`WEBHOOK SUCCESS: ₦ ${amountNaira} credited to user ${userId}`);
+        try {
+          await WalletTransaction.create({
+            user: userId,
+            type: 'deposit',
+            amountMoney: amountNaira,
+            coinsChange: 0,
+            description: 'Paystack Direct Webhook Deposit',
+            reference: ref,
+            status: 'completed'
+          });
+          await User.findByIdAndUpdate(userId, { $inc: { balance: amountNaira } });
+          console.log(`WEBHOOK SUCCESS: ₦ ${amountNaira} credited to user ${userId}`);
+        } catch (err: any) {
+          if (err.code !== 11000) throw err; // duplicate reference — already credited, ignore
+        }
       }
     }
 
@@ -204,18 +254,27 @@ export const handlePaystackWebhook = async (req: Request, res: Response) => {
   }
 };
 
-// 4. Retrieve User Wallet Transaction Ledger History
+// 4. Retrieve User Wallet Transaction Ledger History (paginated)
 export const getWalletTransactions = async (req: AuthRequest, res: Response) => {
   try {
     const userId = req.userId;
+    const page = Math.max(1, parseInt(req.query.page as string, 10) || 1);
+    const limit = Math.min(50, Math.max(1, parseInt(req.query.limit as string, 10) || 10));
+
+    const totalCount = await WalletTransaction.countDocuments({ user: userId });
     const transactions = await WalletTransaction.find({ user: userId })
       .sort({ createdAt: -1 })
-      .limit(100);
+      .skip((page - 1) * limit)
+      .limit(limit);
 
     return res.status(200).json({
       success: true,
       count: transactions.length,
-      transactions
+      transactions,
+      page,
+      limit,
+      totalCount,
+      totalPages: Math.max(1, Math.ceil(totalCount / limit))
     });
   } catch (error: any) {
     return res.status(500).json({ success: false, message: error.message });

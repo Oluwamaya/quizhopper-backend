@@ -6,6 +6,12 @@ import { GameSession } from '../models/GameSession';
 import { getGlobalConfig } from '../models/AppConfig';
 import { AuthRequest } from '../middlewares/authMiddleware';
 
+// Escape regex metacharacters so user search input is always treated as a
+// literal substring — an unescaped pattern could both cause a NoSQL/ReDoS
+// style catastrophic-backtracking match and behave unexpectedly for users
+// who type things like "." or "(".
+const escapeRegex = (value: string): string => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
 // Retrieve global system configuration (commission rate, player limit)
 export const getAdminConfig = async (req: AuthRequest, res: Response) => {
   try {
@@ -19,21 +25,21 @@ export const getAdminConfig = async (req: AuthRequest, res: Response) => {
 // Update global system configuration (commission rate, player limit)
 export const updateAdminConfig = async (req: AuthRequest, res: Response) => {
   try {
-    const { commissionRate, freeTierLimit, coinPrice, quizPriceCoins, sellerCoinShare, platformCoinFee } = req.body;
+    const { freeTierLimit, extraPlayerCoinCost, coinPrice, quizPriceCoins } = req.body;
     const config = await getGlobalConfig();
-
-    if (commissionRate !== undefined) {
-      if (commissionRate < 0 || commissionRate > 0.9) {
-        return res.status(400).json({ success: false, message: 'Commission rate must be between 0% and 90% (0.0 to 0.9)' });
-      }
-      config.commissionRate = commissionRate;
-    }
 
     if (freeTierLimit !== undefined) {
       if (freeTierLimit < 2 || freeTierLimit > 1000) {
         return res.status(400).json({ success: false, message: 'Free-tier player limit must be between 2 and 1000' });
       }
       config.freeTierLimit = freeTierLimit;
+    }
+
+    if (extraPlayerCoinCost !== undefined) {
+      if (extraPlayerCoinCost < 0) {
+        return res.status(400).json({ success: false, message: 'Extra player coin cost must be 0 or greater' });
+      }
+      config.extraPlayerCoinCost = extraPlayerCoinCost;
     }
 
     if (coinPrice !== undefined) {
@@ -48,20 +54,6 @@ export const updateAdminConfig = async (req: AuthRequest, res: Response) => {
         return res.status(400).json({ success: false, message: 'Default quiz price must be between 0 and 10 coins' });
       }
       config.quizPriceCoins = quizPriceCoins;
-    }
-
-    if (sellerCoinShare !== undefined) {
-      if (sellerCoinShare < 0) {
-        return res.status(400).json({ success: false, message: 'Seller coin share must be 0 or greater' });
-      }
-      config.sellerCoinShare = sellerCoinShare;
-    }
-
-    if (platformCoinFee !== undefined) {
-      if (platformCoinFee < 0) {
-        return res.status(400).json({ success: false, message: 'Platform coin fee must be 0 or greater' });
-      }
-      config.platformCoinFee = platformCoinFee;
     }
 
     config.updatedAt = new Date();
@@ -81,10 +73,8 @@ export const getPlatformStats = async (req: AuthRequest, res: Response) => {
     const totalPurchases = await QuizPurchase.countDocuments();
     
     const purchases = await QuizPurchase.find();
-    const config = await getGlobalConfig();
-    
-    const totalVolume = purchases.reduce((acc, curr) => acc + curr.pricePaid, 0);
-    const platformEarnings = purchases.reduce((acc, curr) => acc + (curr.pricePaid * config.commissionRate), 0);
+
+    const totalVolumeCoins = purchases.reduce((acc, curr) => acc + curr.pricePaid, 0);
 
     const activeSessions = await GameSession.countDocuments({ state: { $ne: 'FINISHED' } });
     const totalFinishedGames = await GameSession.countDocuments({ state: 'FINISHED' });
@@ -95,8 +85,7 @@ export const getPlatformStats = async (req: AuthRequest, res: Response) => {
         totalUsers,
         totalQuizzes,
         totalPurchases,
-        totalVolume: Number(totalVolume.toFixed(2)),
-        platformEarnings: Number(platformEarnings.toFixed(2)),
+        totalVolumeCoins,
         activeSessions,
         totalFinishedGames
       }
@@ -109,14 +98,15 @@ export const getPlatformStats = async (req: AuthRequest, res: Response) => {
 // Retrieve users list with search filter
 export const getPlatformUsers = async (req: AuthRequest, res: Response) => {
   try {
-    const search = req.query.search as string;
+    const search = typeof req.query.search === 'string' ? req.query.search.trim().slice(0, 100) : '';
     let query = {};
-    
+
     if (search) {
+      const safePattern = escapeRegex(search);
       query = {
         $or: [
-          { displayName: { $regex: search, $options: 'i' } },
-          { email: { $regex: search, $options: 'i' } }
+          { displayName: { $regex: safePattern, $options: 'i' } },
+          { email: { $regex: safePattern, $options: 'i' } }
         ]
       };
     }
@@ -165,6 +155,7 @@ export const getPlatformUserDetail = async (req: AuthRequest, res: Response) => 
         isPremium: user.isPremium,
         isAdmin: user.isAdmin,
         balance: user.balance,
+        coins: user.coins,
         salesCount: user.salesCount,
         createdAt: user.createdAt,
         quizzesCreated,
@@ -176,11 +167,11 @@ export const getPlatformUserDetail = async (req: AuthRequest, res: Response) => 
   }
 };
 
-// Modify user flags (grant Premium, Toggle Admin, adjust balance)
+// Modify user flags (grant Premium, Toggle Admin, adjust balance/coins)
 export const updateUserStatus = async (req: AuthRequest, res: Response) => {
   try {
-    const { targetUserId, isPremium, isAdmin, balance } = req.body;
-    
+    const { targetUserId, isPremium, isAdmin, balance, coins } = req.body;
+
     if (!targetUserId) {
       return res.status(400).json({ success: false, message: 'Target User ID is required' });
     }
@@ -192,7 +183,20 @@ export const updateUserStatus = async (req: AuthRequest, res: Response) => {
     const updateFields: any = {};
     if (isPremium !== undefined) updateFields.isPremium = !!isPremium;
     if (isAdmin !== undefined) updateFields.isAdmin = !!isAdmin;
-    if (balance !== undefined) updateFields.balance = Number(balance);
+    if (balance !== undefined) {
+      const numericBalance = Number(balance);
+      if (!Number.isFinite(numericBalance) || numericBalance < 0) {
+        return res.status(400).json({ success: false, message: 'Balance must be a non-negative number' });
+      }
+      updateFields.balance = numericBalance;
+    }
+    if (coins !== undefined) {
+      const numericCoins = Number(coins);
+      if (!Number.isFinite(numericCoins) || numericCoins < 0) {
+        return res.status(400).json({ success: false, message: 'Coins must be a non-negative number' });
+      }
+      updateFields.coins = numericCoins;
+    }
 
     const user = await User.findByIdAndUpdate(targetUserId, updateFields, { new: true });
     if (!user) {
@@ -209,8 +213,11 @@ export const updateUserStatus = async (req: AuthRequest, res: Response) => {
 export const broadcastAnnouncement = async (req: AuthRequest, res: Response) => {
   try {
     const { message } = req.body;
-    if (!message || !message.trim()) {
+    if (!message || typeof message !== 'string' || !message.trim()) {
       return res.status(400).json({ success: false, message: 'Announcement message cannot be empty' });
+    }
+    if (message.length > 500) {
+      return res.status(400).json({ success: false, message: 'Announcement message must be under 500 characters' });
     }
 
     const io = req.app.get('socketio');

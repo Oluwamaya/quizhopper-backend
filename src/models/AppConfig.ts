@@ -2,23 +2,19 @@ import { Schema, model, Document } from 'mongoose';
 
 export interface IAppConfig extends Document {
   key: string; // e.g. "global"
-  commissionRate: number; // e.g. 0.15 (15%)
-  freeTierLimit: number; // e.g. 10 players
+  freeTierLimit: number; // e.g. 5 players hosted for free
+  extraPlayerCoinCost: number; // coins charged per player above the free tier (e.g. 2)
   coinPrice: number; // exchange rate of 1 coin in currency (e.g. 200 or 1.00)
   quizPriceCoins: number; // default price of marketplace quizzes in coins (e.g. 5)
-  sellerCoinShare: number; // seller payout in coins per sale (e.g. 3)
-  platformCoinFee: number; // platform fee in coins per sale (e.g. 2)
   updatedAt: Date;
 }
 
 const AppConfigSchema = new Schema<IAppConfig>({
   key: { type: String, default: 'global', unique: true },
-  commissionRate: { type: Number, default: 0.15 },
-  freeTierLimit: { type: Number, default: 10 },
+  freeTierLimit: { type: Number, default: 5 },
+  extraPlayerCoinCost: { type: Number, default: 2 },
   coinPrice: { type: Number, default: 200 },
   quizPriceCoins: { type: Number, default: 5 },
-  sellerCoinShare: { type: Number, default: 3 },
-  platformCoinFee: { type: Number, default: 2 },
   updatedAt: { type: Date, default: Date.now }
 });
 
@@ -30,12 +26,10 @@ export const getGlobalConfig = async (): Promise<IAppConfig> => {
   if (!config) {
     config = await AppConfig.create({
       key: 'global',
-      commissionRate: 0.15,
-      freeTierLimit: 10,
+      freeTierLimit: 5,
+      extraPlayerCoinCost: 2,
       coinPrice: 200,
-      quizPriceCoins: 5,
-      sellerCoinShare: 3,
-      platformCoinFee: 2
+      quizPriceCoins: 5
     });
   }
   return config;

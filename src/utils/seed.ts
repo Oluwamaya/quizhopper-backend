@@ -1,10 +1,8 @@
 import mongoose from 'mongoose';
-import dotenv from 'dotenv';
 import { Quiz } from '../models/Quiz';
+import { env } from '../config/env';
 
-dotenv.config();
-
-const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/quizhopper';
+const MONGODB_URI = env.MONGODB_URI;
 
 const defaultQuizzes = [
   {

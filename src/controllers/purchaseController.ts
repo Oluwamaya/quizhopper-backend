@@ -12,7 +12,7 @@ export const purchaseQuiz = async (req: AuthRequest, res: Response) => {
     const { quizId } = req.body;
     const buyerId = req.userId;
 
-    if (!quizId) {
+    if (!quizId || typeof quizId !== 'string') {
       return res.status(400).json({ success: false, message: 'Quiz ID is required' });
     }
 
@@ -35,21 +35,44 @@ export const purchaseQuiz = async (req: AuthRequest, res: Response) => {
     const config = await getGlobalConfig();
     const costInCoins = quiz.priceCoins > 0 ? quiz.priceCoins : (config.quizPriceCoins || 5);
 
-    const buyer = await User.findById(buyerId);
-    if (!buyer) {
-      return res.status(404).json({ success: false, message: 'Buyer user account not found' });
-    }
+    // Atomic conditional deduction — requiring coins >= cost in the update
+    // filter makes the balance-check-and-deduct a single atomic operation,
+    // so two concurrent purchase clicks can't both pass a stale balance
+    // check and double-spend the same coins.
+    const buyer = await User.findOneAndUpdate(
+      { _id: buyerId, coins: { $gte: costInCoins } },
+      { $inc: { coins: -costInCoins } },
+      { new: true }
+    );
 
-    if (buyer.coins < costInCoins) {
+    if (!buyer) {
+      const buyerExists = await User.findById(buyerId).select('coins');
+      if (!buyerExists) {
+        return res.status(404).json({ success: false, message: 'Buyer user account not found' });
+      }
       return res.status(400).json({
         success: false,
-        message: `Insufficient coins. You need ${costInCoins} coins to unlock this quiz. Current coins: ${buyer.coins}`
+        message: `Insufficient coins. You need ${costInCoins} coins to unlock this quiz. Current coins: ${buyerExists.coins}`
       });
     }
 
-    // Deduct coins from buyer
-    buyer.coins -= costInCoins;
-    await buyer.save();
+    // 3. Create the purchase transaction. `buyer + quiz` has a unique index,
+    // so if a concurrent request already recorded this purchase, this
+    // throws — refund the coins we just deducted rather than charging twice.
+    let purchase;
+    try {
+      purchase = await QuizPurchase.create({
+        buyer: buyerId,
+        quiz: quizId,
+        pricePaid: costInCoins
+      });
+    } catch (err: any) {
+      if (err.code === 11000) {
+        await User.findByIdAndUpdate(buyerId, { $inc: { coins: costInCoins } });
+        return res.status(400).json({ success: false, message: 'You have already purchased this quiz' });
+      }
+      throw err;
+    }
 
     // Log buyer coin deduction
     await WalletTransaction.create({
@@ -61,16 +84,10 @@ export const purchaseQuiz = async (req: AuthRequest, res: Response) => {
       status: 'completed'
     });
 
-    // 3. Create the purchase transaction
-    const purchase = await QuizPurchase.create({
-      buyer: buyerId,
-      quiz: quizId,
-      pricePaid: costInCoins
-    });
-
-    // 4. Distribute seller coin earnings
+    // 4. Distribute seller coin earnings — the seller keeps 100% of the
+    // coin price; the platform takes no cut on marketplace quiz sales.
     if (quiz.creator) {
-      const sellerEarn = config.sellerCoinShare !== undefined ? config.sellerCoinShare : 3;
+      const sellerEarn = costInCoins;
       await User.findByIdAndUpdate(quiz.creator, {
         $inc: {
           coins: sellerEarn,
@@ -108,31 +125,33 @@ export const getSellerDashboard = async (req: AuthRequest, res: Response) => {
       return res.status(404).json({ success: false, message: 'Seller not found' });
     }
 
-    const config = await getGlobalConfig();
-    const commissionMultiplier = 1 - config.commissionRate;
+    const page = Math.max(1, parseInt(req.query.page as string, 10) || 1);
+    const limit = Math.min(50, Math.max(1, parseInt(req.query.limit as string, 10) || 10));
 
     // Find all quizzes authored by this user
     const sellerQuizzes = await Quiz.find({ creator: userId });
     const quizIds = sellerQuizzes.map(q => q._id);
 
-    // Retrieve all sales transactions for these quizzes
+    const totalCount = await QuizPurchase.countDocuments({ quiz: { $in: quizIds } });
+
+    // Retrieve a page of sales transactions for these quizzes
     const salesTransactions = await QuizPurchase.find({ quiz: { $in: quizIds } })
       .populate('buyer', 'displayName email')
-      .populate('quiz', 'title price')
-      .sort({ createdAt: -1 });
+      .populate('quiz', 'title')
+      .sort({ createdAt: -1 })
+      .skip((page - 1) * limit)
+      .limit(limit);
 
-    const formattedSales = salesTransactions.map((sale: any) => {
-      const amountEarned = Number((sale.pricePaid * commissionMultiplier).toFixed(2));
-      return {
-        id: sale._id,
-        buyerName: sale.buyer ? sale.buyer.displayName : 'Anonymous',
-        buyerEmail: sale.buyer ? sale.buyer.email : '',
-        quizTitle: sale.quiz ? sale.quiz.title : 'Deleted Quiz',
-        pricePaid: sale.pricePaid,
-        earnings: amountEarned,
-        date: sale.createdAt
-      };
-    });
+    // Sellers keep 100% of the coin price on every sale — no platform cut.
+    const formattedSales = salesTransactions.map((sale: any) => ({
+      id: sale._id,
+      buyerName: sale.buyer ? sale.buyer.displayName : 'Anonymous',
+      buyerEmail: sale.buyer ? sale.buyer.email : '',
+      quizTitle: sale.quiz ? sale.quiz.title : 'Deleted Quiz',
+      pricePaid: sale.pricePaid,
+      earnings: sale.pricePaid,
+      date: sale.createdAt
+    }));
 
     return res.status(200).json({
       success: true,
@@ -141,7 +160,11 @@ export const getSellerDashboard = async (req: AuthRequest, res: Response) => {
         salesCount: seller.salesCount,
         publishedQuizzesCount: sellerQuizzes.length
       },
-      salesHistory: formattedSales
+      salesHistory: formattedSales,
+      page,
+      limit,
+      totalCount,
+      totalPages: Math.max(1, Math.ceil(totalCount / limit))
     });
   } catch (error: any) {
     return res.status(500).json({ success: false, message: error.message });
@@ -170,50 +193,6 @@ export const getPurchaseHistory = async (req: AuthRequest, res: Response) => {
     }));
 
     return res.status(200).json({ success: true, count: history.length, history });
-  } catch (error: any) {
-    return res.status(500).json({ success: false, message: error.message });
-  }
-};
-
-// Process payout withdrawal for a seller
-export const withdrawEarnings = async (req: AuthRequest, res: Response) => {
-  try {
-    const { amount } = req.body;
-    const userId = req.userId;
-
-    if (!amount || amount <= 0) {
-      return res.status(400).json({ success: false, message: 'Invalid withdrawal amount' });
-    }
-
-    const seller = await User.findById(userId);
-    if (!seller) {
-      return res.status(404).json({ success: false, message: 'User not found' });
-    }
-
-    if (amount > seller.balance) {
-      return res.status(400).json({ success: false, message: 'Insufficient balance' });
-    }
-
-    // Deduct balance
-    seller.balance = Number((seller.balance - amount).toFixed(2));
-    await seller.save();
-
-    await WalletTransaction.create({
-      user: userId,
-      type: 'withdrawal',
-      amountMoney: -amount,
-      coinsChange: 0,
-      description: `Naira Bank Payout Withdrawal (₦ ${amount.toLocaleString()})`,
-      status: 'completed'
-    });
-
-    console.log(`WITHDRAWAL PROCESSED: ₦ ${amount} paid out to seller ${seller.email}`);
-
-    return res.status(200).json({
-      success: true,
-      message: `Withdrawal of ₦ ${amount.toLocaleString()} processed successfully!`,
-      newBalance: seller.balance
-    });
   } catch (error: any) {
     return res.status(500).json({ success: false, message: error.message });
   }

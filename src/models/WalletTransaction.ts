@@ -26,4 +26,9 @@ const WalletTransactionSchema = new Schema<IWalletTransaction>({
   createdAt: { type: Date, default: Date.now }
 });
 
+// Prevent the same payment-provider reference from ever being credited
+// twice, even under concurrent requests (sparse: most transaction types
+// have no reference at all).
+WalletTransactionSchema.index({ reference: 1 }, { unique: true, sparse: true });
+
 export const WalletTransaction = model<IWalletTransaction>('WalletTransaction', WalletTransactionSchema);

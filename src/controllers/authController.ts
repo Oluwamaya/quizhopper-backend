@@ -7,9 +7,15 @@ import { WalletTransaction } from '../models/WalletTransaction';
 import { getGlobalConfig } from '../models/AppConfig';
 import { registerSubscription } from '../services/pushService';
 import { AuthRequest } from '../middlewares/authMiddleware';
+import { env } from '../config/env';
 
-const JWT_SECRET = process.env.JWT_SECRET || 'super_secret_jwt_key_quizhopper_2026';
-const CLIENT_URL = process.env.CLIENT_URL || 'http://localhost:5173';
+const JWT_SECRET = env.JWT_SECRET;
+const CLIENT_URL = env.CLIENT_URL;
+
+// Minimum acceptable password strength for new/changed passwords
+const isPasswordStrongEnough = (password: string): boolean => {
+  return typeof password === 'string' && password.length >= 8;
+};
 
 // Transient memory-store for mock password reset tokens
 // Key: resetToken, Value: { email, expires }
@@ -24,7 +30,7 @@ const sendTokenResponse = (user: any, statusCode: number, res: Response) => {
   const cookieOptions = {
     expires: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000), // 30 days
     httpOnly: true,
-    secure: process.env.NODE_ENV === 'production',
+    secure: env.isProduction,
     sameSite: 'lax' as const
   };
 
@@ -40,6 +46,24 @@ export const register = async (req: Request, res: Response) => {
       return res.status(400).json({ success: false, message: 'Display name, email, and password are required' });
     }
 
+    if (typeof displayName !== 'string' || typeof email !== 'string' || typeof password !== 'string') {
+      return res.status(400).json({ success: false, message: 'Invalid input format' });
+    }
+
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
+      return res.status(400).json({ success: false, message: 'Please provide a valid email address' });
+    }
+
+    if (!isPasswordStrongEnough(password)) {
+      return res.status(400).json({ success: false, message: 'Password must be at least 8 characters long' });
+    }
+
+    if (displayName.trim().length < 2 || displayName.trim().length > 32) {
+      return res.status(400).json({ success: false, message: 'Display name must be between 2 and 32 characters' });
+    }
+
+    const normalizedEmail = email.trim().toLowerCase();
+
     // Check if displayName (username) is unique
     const usernameTaken = await User.findOne({ displayName: displayName.trim() });
     if (usernameTaken) {
@@ -47,7 +71,7 @@ export const register = async (req: Request, res: Response) => {
     }
 
     // Check if email already registered
-    const userExists = await User.findOne({ email });
+    const userExists = await User.findOne({ email: normalizedEmail });
     if (userExists) {
       return res.status(400).json({ success: false, message: 'Email address is already in use' });
     }
@@ -60,7 +84,7 @@ export const register = async (req: Request, res: Response) => {
 
     const user = await User.create({
       displayName: displayName.trim(),
-      email,
+      email: normalizedEmail,
       password: hashedPassword,
       avatarUrl: `https://api.dicebear.com/7.x/adventurer/svg?seed=${encodeURIComponent(displayName)}`,
       isAdmin: isFirstUser,
@@ -94,11 +118,11 @@ export const register = async (req: Request, res: Response) => {
 export const login = async (req: Request, res: Response) => {
   try {
     const { email, password } = req.body;
-    if (!email || !password) {
+    if (!email || !password || typeof email !== 'string' || typeof password !== 'string') {
       return res.status(400).json({ success: false, message: 'Email and password are required' });
     }
 
-    const user = await User.findOne({ email });
+    const user = await User.findOne({ email: email.trim().toLowerCase() }).select('+password');
     if (!user || !user.password) {
       return res.status(401).json({ success: false, message: 'Invalid credentials' });
     }
@@ -133,11 +157,11 @@ export const login = async (req: Request, res: Response) => {
 export const adminLogin = async (req: Request, res: Response) => {
   try {
     const { email, password } = req.body;
-    if (!email || !password) {
+    if (!email || !password || typeof email !== 'string' || typeof password !== 'string') {
       return res.status(400).json({ success: false, message: 'Email and password are required' });
     }
 
-    const user = await User.findOne({ email });
+    const user = await User.findOne({ email: email.trim().toLowerCase() }).select('+password');
     if (!user || !user.password) {
       return res.status(401).json({ success: false, message: 'Invalid administrator credentials' });
     }
@@ -178,11 +202,15 @@ export const updateProfile = async (req: AuthRequest, res: Response) => {
     const { displayName } = req.body;
     const userId = req.userId;
 
-    if (!displayName || !displayName.trim()) {
+    if (!displayName || typeof displayName !== 'string' || !displayName.trim()) {
       return res.status(400).json({ success: false, message: 'Display name cannot be empty' });
     }
 
     const trimmedName = displayName.trim();
+
+    if (trimmedName.length < 2 || trimmedName.length > 32) {
+      return res.status(400).json({ success: false, message: 'Display name must be between 2 and 32 characters' });
+    }
 
     // Check if the username is already taken by another user
     const usernameTaken = await User.findOne({ 
@@ -229,11 +257,11 @@ export const changePassword = async (req: AuthRequest, res: Response) => {
     const { currentPassword, newPassword } = req.body;
     const userId = req.userId;
 
-    if (!currentPassword || !newPassword) {
+    if (!currentPassword || !newPassword || typeof newPassword !== 'string') {
       return res.status(400).json({ success: false, message: 'Current password and new password are required' });
     }
 
-    const user = await User.findById(userId);
+    const user = await User.findById(userId).select('+password');
     if (!user || !user.password) {
       return res.status(404).json({ success: false, message: 'User not found or password not set' });
     }
@@ -243,8 +271,8 @@ export const changePassword = async (req: AuthRequest, res: Response) => {
       return res.status(400).json({ success: false, message: 'Incorrect current password' });
     }
 
-    if (newPassword.length < 6) {
-      return res.status(400).json({ success: false, message: 'New password must be at least 6 characters long' });
+    if (!isPasswordStrongEnough(newPassword)) {
+      return res.status(400).json({ success: false, message: 'New password must be at least 8 characters long' });
     }
 
     const salt = await bcrypt.genSalt(10);
@@ -261,33 +289,41 @@ export const changePassword = async (req: AuthRequest, res: Response) => {
 export const forgotPassword = async (req: Request, res: Response) => {
   try {
     const { email } = req.body;
-    if (!email) {
+    if (!email || typeof email !== 'string') {
       return res.status(400).json({ success: false, message: 'Email address is required' });
     }
 
-    const user = await User.findOne({ email });
+    // Generic response regardless of outcome — do not reveal whether an
+    // account exists for this email (prevents user enumeration).
+    const genericResponse = {
+      success: true,
+      message: 'If an account exists for this email address, password reset instructions have been sent.'
+    };
+
+    const user = await User.findOne({ email: email.trim().toLowerCase() });
     if (!user) {
-      return res.status(404).json({ success: false, message: 'No user registered with this email address' });
+      return res.status(200).json(genericResponse);
     }
 
     // Generate token
-    const resetToken = crypto.randomBytes(20).toString('hex');
+    const resetToken = crypto.randomBytes(32).toString('hex');
     const expires = Date.now() + 3600000; // 1 hour expiration
 
-    resetTokensStore.set(resetToken, { email, expires });
+    resetTokensStore.set(resetToken, { email: user.email, expires });
 
     const resetLink = `${CLIENT_URL}/reset-password?token=${resetToken}`;
     console.log('\n======================================================');
-    console.log(`PASSWORD RESET REQUEST RECEIVED FOR: ${email}`);
+    console.log(`PASSWORD RESET REQUEST RECEIVED FOR: ${user.email}`);
     console.log(`Link: ${resetLink}`);
     console.log('======================================================\n');
 
-    return res.status(200).json({
-      success: true,
-      message: 'Password reset instructions have been logged to the server console. Open the link to proceed.',
-      // Return the link directly in dev-mode responses so the client can click it easily!
-      devResetLink: resetLink
-    });
+    // The reset link/token must never be returned in the API response in
+    // production — that would let anyone take over any account just by
+    // knowing their email. Only expose it in local development, where
+    // there's no real email delivery configured yet.
+    return res.status(200).json(
+      env.isProduction ? genericResponse : { ...genericResponse, devResetLink: resetLink }
+    );
   } catch (error: any) {
     return res.status(500).json({ success: false, message: error.message });
   }
@@ -297,7 +333,7 @@ export const forgotPassword = async (req: Request, res: Response) => {
 export const resetPassword = async (req: Request, res: Response) => {
   try {
     const { token, newPassword } = req.body;
-    if (!token || !newPassword) {
+    if (!token || !newPassword || typeof token !== 'string' || typeof newPassword !== 'string') {
       return res.status(400).json({ success: false, message: 'Token and new password are required' });
     }
 
@@ -311,8 +347,8 @@ export const resetPassword = async (req: Request, res: Response) => {
       return res.status(400).json({ success: false, message: 'Password reset token has expired' });
     }
 
-    if (newPassword.length < 6) {
-      return res.status(400).json({ success: false, message: 'Password must be at least 6 characters long' });
+    if (!isPasswordStrongEnough(newPassword)) {
+      return res.status(400).json({ success: false, message: 'Password must be at least 8 characters long' });
     }
 
     const user = await User.findOne({ email: tokenDetails.email });
@@ -342,20 +378,27 @@ export const googleSuccess = (req: Request, res: Response) => {
   res.redirect(`${CLIENT_URL}/auth/callback?token=${token}`);
 };
 
-// Developer Bypass Login Route (Mock Login)
+// Developer Bypass Login Route (Mock Login) — disabled outside development,
+// since it authenticates as any email with no password check.
 export const devLogin = async (req: Request, res: Response) => {
+  if (env.isProduction) {
+    return res.status(404).json({ success: false, message: 'Not found' });
+  }
+
   try {
     const { email, displayName } = req.body;
-    if (!email) {
+    if (!email || typeof email !== 'string') {
       return res.status(400).json({ success: false, message: 'Email is required for mock login' });
     }
 
-    let user = await User.findOne({ email });
+    const normalizedEmail = email.trim().toLowerCase();
+
+    let user = await User.findOne({ email: normalizedEmail });
     if (!user) {
       const isFirst = (await User.countDocuments()) === 0;
       user = await User.create({
-        displayName: displayName || email.split('@')[0],
-        email: email,
+        displayName: displayName || normalizedEmail.split('@')[0],
+        email: normalizedEmail,
         avatarUrl: `https://api.dicebear.com/7.x/adventurer/svg?seed=${encodeURIComponent(email)}`,
         isPremium: false,
         isAdmin: isFirst,
@@ -429,7 +472,7 @@ export const getMe = async (req: AuthRequest, res: Response) => {
 export const getVapidKey = (req: Request, res: Response) => {
   return res.status(200).json({
     success: true,
-    publicKey: process.env.VAPID_PUBLIC_KEY || ''
+    publicKey: env.VAPID_PUBLIC_KEY
   });
 };
 
@@ -445,29 +488,32 @@ export const logout = (req: Request, res: Response) => {
 // Purchase hosting coins using wallet balance
 export const buyCoins = async (req: AuthRequest, res: Response) => {
   const { amount } = req.body;
-  if (!amount || typeof amount !== 'number' || amount <= 0) {
+  if (!amount || typeof amount !== 'number' || !Number.isFinite(amount) || amount <= 0 || !Number.isInteger(amount) || amount > 100000) {
     return res.status(400).json({ success: false, message: 'Invalid coins amount requested' });
   }
 
   try {
-    const user = await User.findById(req.userId);
-    if (!user) {
-      return res.status(404).json({ success: false, message: 'User not found' });
-    }
-
     const config = await getGlobalConfig();
     const totalCost = amount * config.coinPrice;
 
-    if (user.balance < totalCost) {
+    // Atomic conditional deduction — see purchaseQuiz/withdrawEarnings for
+    // why a plain read-check-then-save() is unsafe under concurrent requests.
+    const user = await User.findOneAndUpdate(
+      { _id: req.userId, balance: { $gte: totalCost } },
+      { $inc: { balance: -totalCost, coins: amount } },
+      { new: true }
+    );
+
+    if (!user) {
+      const existing = await User.findById(req.userId).select('balance');
+      if (!existing) {
+        return res.status(404).json({ success: false, message: 'User not found' });
+      }
       return res.status(400).json({
         success: false,
-        message: `Insufficient wallet balance. You need ₦ ${totalCost.toLocaleString()} to purchase ${amount} coins. Current balance: ₦ ${user.balance.toLocaleString()}`
+        message: `Insufficient wallet balance. You need ₦ ${totalCost.toLocaleString()} to purchase ${amount} coins. Current balance: ₦ ${existing.balance.toLocaleString()}`
       });
     }
-
-    user.balance -= totalCost;
-    user.coins = (user.coins || 0) + amount;
-    await user.save();
 
     // Log Wallet Transaction
     await WalletTransaction.create({

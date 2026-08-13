@@ -17,19 +17,20 @@ import {
   buyCoins
 } from '../controllers/authController';
 import { protect } from '../middlewares/authMiddleware';
+import { authLimiter } from '../middlewares/rateLimiters';
 
 const router = Router();
 
 // Standard Auth Mappings
-router.post('/register', register);
-router.post('/login', login);
+router.post('/register', authLimiter, register);
+router.post('/login', authLimiter, login);
 
 // Isolated Admin Login Mapping
-router.post('/admin-login', adminLogin);
+router.post('/admin-login', authLimiter, adminLogin);
 
 // Password Self-Service Mappings (No auth required)
-router.post('/forgot-password', forgotPassword);
-router.post('/reset-password', resetPassword);
+router.post('/forgot-password', authLimiter, forgotPassword);
+router.post('/reset-password', authLimiter, resetPassword);
 
 // Profile & Password Update Mappings (Protected)
 router.post('/profile/update', protect, updateProfile);
@@ -49,8 +50,8 @@ router.get(
   googleSuccess
 );
 
-// Mock login for developer testing
-router.post('/dev-login', devLogin);
+// Mock login for developer testing (controller itself 404s in production)
+router.post('/dev-login', authLimiter, devLogin);
 
 // Get public VAPID key
 router.get('/vapid-key', getVapidKey);

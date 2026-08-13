@@ -20,15 +20,15 @@ export interface IQuiz extends Document {
 }
 
 const QuestionSchema = new Schema<IQuestion>({
-  question: { type: String, required: true },
-  options: [{ type: String, required: true }],
-  correctOption: { type: String, required: true },
+  question: { type: String, required: true, maxlength: 500 },
+  options: [{ type: String, required: true, maxlength: 200 }],
+  correctOption: { type: String, required: true, maxlength: 200 },
   timeLimit: { type: Number, default: 10 }
 });
 
 const QuizSchema = new Schema<IQuiz>({
-  title: { type: String, required: true },
-  description: { type: String },
+  title: { type: String, required: true, maxlength: 120 },
+  description: { type: String, maxlength: 1000 },
   creator: { type: Schema.Types.ObjectId, ref: 'User' },
   questions: [QuestionSchema],
   price: { type: Number, default: 0 },
