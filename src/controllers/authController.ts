@@ -496,8 +496,8 @@ export const buyCoins = async (req: AuthRequest, res: Response) => {
     const config = await getGlobalConfig();
     const totalCost = amount * config.coinPrice;
 
-    // Atomic conditional deduction — see purchaseQuiz/withdrawEarnings for
-    // why a plain read-check-then-save() is unsafe under concurrent requests.
+    // Atomic conditional deduction — see purchaseQuiz for why a plain
+    // read-check-then-save() is unsafe under concurrent requests.
     const user = await User.findOneAndUpdate(
       { _id: req.userId, balance: { $gte: totalCost } },
       { $inc: { balance: -totalCost, coins: amount } },
