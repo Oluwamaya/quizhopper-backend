@@ -18,6 +18,14 @@ interface AuthenticatedSocket extends Socket {
 // Track active timers by game pin
 const activeTimers: { [gamePin: string]: NodeJS.Timeout } = {};
 
+// In-memory cache of each active room's quiz document. player_submit_answer
+// runs inside a per-room lock (see withRoomLock) that serializes concurrent
+// answers, so any awaited work inside it directly multiplies into the queue
+// depth — re-fetching the quiz from Mongo on every single answer would mean
+// 50 simultaneous answers pay 50 serialized Atlas round-trips back to back.
+// The quiz never changes mid-game, so it's fetched once and reused.
+const activeQuizzes: { [gamePin: string]: any } = {};
+
 export const setupGameSockets = (io: Server) => {
   // Socket auth middleware
   io.use((socket: AuthenticatedSocket, next) => {
@@ -122,6 +130,7 @@ export const setupGameSockets = (io: Server) => {
         const sessionObj = session.toObject();
         // Seed cache
         await setRoomCache(gamePin, sessionObj);
+        activeQuizzes[gamePin] = quiz;
 
         socket.join(`room:${gamePin}`);
         console.log(`Host created lobby room:${gamePin} (Limit: ${playerLimit}, Coins spent: ${coinCost})`);
@@ -198,6 +207,7 @@ export const setupGameSockets = (io: Server) => {
         if (!quiz || quiz.questions.length === 0) {
           return socket.emit('error', { message: 'Quiz questions not found' });
         }
+        activeQuizzes[gamePin] = quiz;
 
         const firstQuestion = quiz.questions[0];
 
@@ -243,6 +253,7 @@ export const setupGameSockets = (io: Server) => {
 
         const quiz = await Quiz.findById(session.quiz);
         if (!quiz) return socket.emit('error', { message: 'Quiz not found' });
+        activeQuizzes[gamePin] = quiz;
 
         const nextIndex = session.currentQuestionIndex + 1;
 
@@ -257,6 +268,7 @@ export const setupGameSockets = (io: Server) => {
           }).catch(err => console.error('DB Update error:', err));
 
           await delRoomCache(gamePin);
+          delete activeQuizzes[gamePin];
 
           const finalLeaderboard = [...session.players].sort((a, b) => b.score - a.score);
 
@@ -312,6 +324,7 @@ export const setupGameSockets = (io: Server) => {
 
         // Delete cache
         await delRoomCache(gamePin);
+        delete activeQuizzes[gamePin];
 
         // Notify all clients in the room that the room is closed
         io.to(`room:${gamePin}`).emit('room_closed', {
@@ -436,6 +449,71 @@ export const setupGameSockets = (io: Server) => {
       }
     });
 
+    // Host manually removes a player from the lobby — e.g. a duplicate/ghost
+    // entry left behind by a flaky connection, or someone who's clearly gone.
+    // Scoped to LOBBY only for now: mid-game removal would need to touch
+    // scoring/leaderboard logic and isn't handled here.
+    socket.on('host_remove_player', async ({ gamePin, nickname }: { gamePin: string; nickname: string }) => {
+      try {
+        const result = await withRoomLock(gamePin, async () => {
+          let session = await getRoomCache(gamePin);
+          if (!session) {
+            const dbSession = await GameSession.findOne({ gamePin, state: 'LOBBY' });
+            if (dbSession) session = dbSession.toObject();
+          }
+
+          if (!session) {
+            return { status: 'error' as const, message: 'Game session not found' };
+          }
+          if (session.host.toString() !== socket.userId) {
+            return { status: 'error' as const, message: 'Only the host can remove players' };
+          }
+          if (session.state !== 'LOBBY') {
+            return { status: 'error' as const, message: 'Players can only be removed while the lobby is open' };
+          }
+
+          const playerIndex = session.players.findIndex((p: any) => p.nickname === nickname);
+          if (playerIndex === -1) {
+            return { status: 'error' as const, message: 'Player not found in this session' };
+          }
+
+          const [removedPlayer] = session.players.splice(playerIndex, 1);
+
+          GameSession.updateOne(
+            { _id: session._id },
+            { $pull: { players: { nickname } } }
+          ).catch((err: any) => console.error('DB Update error:', err));
+
+          await setRoomCache(gamePin, session);
+
+          return { status: 'ok' as const, removedPlayer, players: session.players };
+        });
+
+        if (result.status === 'error') {
+          return socket.emit('error', { message: result.message });
+        }
+
+        // Disconnect the removed player's own socket from the room and notify them
+        const removedSocketId = result.removedPlayer.socketId;
+        if (removedSocketId) {
+          const removedSocket = io.sockets.sockets.get(removedSocketId);
+          if (removedSocket) {
+            removedSocket.emit('removed_from_game', { message: 'The host has removed you from this game session.' });
+            removedSocket.leave(`room:${gamePin}`);
+          }
+        }
+
+        // Broadcast updated player list to remaining room members
+        io.to(`room:${gamePin}`).emit('lobby_update', {
+          players: result.players.map((p: any) => ({ nickname: p.nickname, avatar: p.avatar }))
+        });
+
+        console.log(`Host removed player "${nickname}" from room:${gamePin}`);
+      } catch (err: any) {
+        socket.emit('error', { message: err.message });
+      }
+    });
+
     // Helper to construct snapshot of active game room state for rejoining clients
     const getRoomStateSnapshot = async (session: any) => {
       const quiz = await Quiz.findById(session.quiz);
@@ -547,75 +625,100 @@ export const setupGameSockets = (io: Server) => {
     // 5. Player submits an answer
     socket.on('player_submit_answer', async ({ gamePin, selectedAnswer }: { gamePin: string; selectedAnswer: string }) => {
       try {
-        let session = await getRoomCache(gamePin);
-        if (!session) {
-          const dbSession = await GameSession.findOne({ gamePin, state: 'QUESTION_ACTIVE' });
-          if (dbSession) session = dbSession.toObject();
-        }
-
-        if (!session || session.state !== 'QUESTION_ACTIVE') {
-          return socket.emit('error', { message: 'Game is not accepting answers right now' });
-        }
-
-        const player = session.players.find((p: any) => p.socketId === socket.id);
-        if (!player) {
-          return socket.emit('error', { message: 'Player record not found in session' });
-        }
-
-        const alreadyAnswered = player.answers.some((ans: any) => ans.questionIndex === session.currentQuestionIndex);
-        if (alreadyAnswered) {
-          return socket.emit('error', { message: 'Answer already submitted' });
-        }
-
-        const quiz = await Quiz.findById(session.quiz);
-        if (!quiz) return socket.emit('error', { message: 'Quiz not found' });
-
-        const currentQuestion = quiz.questions[session.currentQuestionIndex];
-        const isCorrect = (selectedAnswer === currentQuestion.correctOption);
-
-        const timeTakenMs = new Date().getTime() - new Date(session.questionActiveSince).getTime();
-        const timeLimitMs = currentQuestion.timeLimit * 1000;
-        
-        let scoreAwarded = 0;
-        if (isCorrect) {
-          const ratio = Math.min(timeTakenMs / timeLimitMs, 1.0);
-          scoreAwarded = Math.round(100 * (1 - ratio * 0.5));
-        }
-
-        const answerLog = {
-          questionIndex: session.currentQuestionIndex,
-          selectedAnswer,
-          isCorrect,
-          scoreAwarded,
-          timeTakenMs,
-          submittedAt: new Date()
-        };
-
-        player.answers.push(answerLog);
-        player.score += scoreAwarded;
-
-        GameSession.updateOne(
-          { _id: session._id, 'players.socketId': socket.id },
-          { 
-            $push: { 'players.$.answers': answerLog },
-            $inc: { 'players.$.score': scoreAwarded }
+        // Same read-modify-write hazard as player_join_lobby: without the lock,
+        // two players answering in the same instant could both read the same
+        // pre-answer cached session and each write their own version back,
+        // silently dropping whichever player's answer/score got overwritten
+        // from the live leaderboard cache (Mongo stays correct via $inc/$push,
+        // but the in-memory room state used to broadcast the scoreboard would not).
+        const result = await withRoomLock(gamePin, async () => {
+          let session = await getRoomCache(gamePin);
+          if (!session) {
+            const dbSession = await GameSession.findOne({ gamePin, state: 'QUESTION_ACTIVE' });
+            if (dbSession) session = dbSession.toObject();
           }
-        ).catch(err => console.error('DB Update error:', err));
 
-        await setRoomCache(gamePin, session);
+          if (!session || session.state !== 'QUESTION_ACTIVE') {
+            return { status: 'error' as const, message: 'Game is not accepting answers right now' };
+          }
 
-        socket.emit('answer_received', { isCorrect, scoreAwarded, totalScore: player.score });
+          const player = session.players.find((p: any) => p.socketId === socket.id);
+          if (!player) {
+            return { status: 'error' as const, message: 'Player record not found in session' };
+          }
 
-        const activeSocketsInRoom = io.sockets.adapter.rooms.get(`room:${gamePin}`);
-        const playerSockets = session.players.map((p: any) => p.socketId);
-        const joinedPlayerSocketsInRoom = Array.from(activeSocketsInRoom || []).filter(sid => playerSockets.includes(sid));
+          const alreadyAnswered = player.answers.some((ans: any) => ans.questionIndex === session.currentQuestionIndex);
+          if (alreadyAnswered) {
+            return { status: 'error' as const, message: 'Answer already submitted' };
+          }
 
-        const answeredCount = session.players.filter((p: any) => 
-          p.socketId && joinedPlayerSocketsInRoom.includes(p.socketId) && 
-          p.answers.some((ans: any) => ans.questionIndex === session.currentQuestionIndex)
-        ).length;
+          // Read from the in-memory quiz cache instead of hitting Mongo on every
+          // single answer — this runs inside the per-room lock, so a DB round-trip
+          // here would be paid once per player, serially, for every simultaneous
+          // answer burst. Fall back to a fresh fetch only if the cache was never
+          // populated (e.g. server restarted mid-game).
+          let quiz = activeQuizzes[gamePin];
+          if (!quiz) {
+            quiz = await Quiz.findById(session.quiz);
+            if (!quiz) return { status: 'error' as const, message: 'Quiz not found' };
+            activeQuizzes[gamePin] = quiz;
+          }
 
-        if (answeredCount >= joinedPlayerSocketsInRoom.length && joinedPlayerSocketsInRoom.length > 0) {
+          const currentQuestion = quiz.questions[session.currentQuestionIndex];
+          const isCorrect = (selectedAnswer === currentQuestion.correctOption);
+
+          const timeTakenMs = new Date().getTime() - new Date(session.questionActiveSince).getTime();
+          const timeLimitMs = currentQuestion.timeLimit * 1000;
+
+          let scoreAwarded = 0;
+          if (isCorrect) {
+            const ratio = Math.min(timeTakenMs / timeLimitMs, 1.0);
+            scoreAwarded = Math.round(100 * (1 - ratio * 0.5));
+          }
+
+          const answerLog = {
+            questionIndex: session.currentQuestionIndex,
+            selectedAnswer,
+            isCorrect,
+            scoreAwarded,
+            timeTakenMs,
+            submittedAt: new Date()
+          };
+
+          player.answers.push(answerLog);
+          player.score += scoreAwarded;
+
+          GameSession.updateOne(
+            { _id: session._id, 'players.socketId': socket.id },
+            {
+              $push: { 'players.$.answers': answerLog },
+              $inc: { 'players.$.score': scoreAwarded }
+            }
+          ).catch(err => console.error('DB Update error:', err));
+
+          await setRoomCache(gamePin, session);
+
+          const activeSocketsInRoom = io.sockets.adapter.rooms.get(`room:${gamePin}`);
+          const playerSockets = session.players.map((p: any) => p.socketId);
+          const joinedPlayerSocketsInRoom = Array.from(activeSocketsInRoom || []).filter(sid => playerSockets.includes(sid));
+
+          const answeredCount = session.players.filter((p: any) =>
+            p.socketId && joinedPlayerSocketsInRoom.includes(p.socketId) &&
+            p.answers.some((ans: any) => ans.questionIndex === session.currentQuestionIndex)
+          ).length;
+
+          const allAnswered = answeredCount >= joinedPlayerSocketsInRoom.length && joinedPlayerSocketsInRoom.length > 0;
+
+          return { status: 'ok' as const, isCorrect, scoreAwarded, totalScore: player.score, allAnswered };
+        });
+
+        if (result.status === 'error') {
+          return socket.emit('error', { message: result.message });
+        }
+
+        socket.emit('answer_received', { isCorrect: result.isCorrect, scoreAwarded: result.scoreAwarded, totalScore: result.totalScore });
+
+        if (result.allAnswered) {
           console.log(`All players in room:${gamePin} answered. Ending question early.`);
           clearTimeout(activeTimers[gamePin]);
           endQuestion(io, gamePin);
@@ -656,63 +759,75 @@ const endQuestion = async (io: Server, gamePin: string) => {
   delete activeTimers[gamePin];
 
   try {
-    let session = await getRoomCache(gamePin);
-    if (!session) {
-      session = await GameSession.findOne({ gamePin, state: 'QUESTION_ACTIVE' });
-      if (session) session = session.toObject();
-    }
+    // Wrapped in the same per-room lock as player_submit_answer so a
+    // timer expiring at the exact instant the last player answers (both
+    // paths call endQuestion) can't run concurrently and double-broadcast.
+    // The QUESTION_ACTIVE guard below makes a second, queued-up call a safe
+    // no-op once the first call has already transitioned the room's state.
+    await withRoomLock(gamePin, async () => {
+      let session = await getRoomCache(gamePin);
+      if (!session) {
+        session = await GameSession.findOne({ gamePin, state: 'QUESTION_ACTIVE' });
+        if (session) session = session.toObject();
+      }
 
-    if (!session) return;
+      if (!session || session.state !== 'QUESTION_ACTIVE') return;
 
-    const quiz = await Quiz.findById(session.quiz);
-    if (!quiz) return;
+      let quiz = activeQuizzes[gamePin];
+      if (!quiz) {
+        quiz = await Quiz.findById(session.quiz);
+        if (!quiz) return;
+        activeQuizzes[gamePin] = quiz;
+      }
 
-    const currentQuestion = quiz.questions[session.currentQuestionIndex];
-    const isLastQuestion = (session.currentQuestionIndex + 1 >= quiz.questions.length);
+      const currentQuestion = quiz.questions[session.currentQuestionIndex];
+      const isLastQuestion = (session.currentQuestionIndex + 1 >= quiz.questions.length);
 
-    if (isLastQuestion) {
-      session.state = 'FINISHED';
-      session.finishedAt = new Date();
+      if (isLastQuestion) {
+        session.state = 'FINISHED';
+        session.finishedAt = new Date();
 
-      GameSession.findByIdAndUpdate(session._id, {
-        state: 'FINISHED',
-        finishedAt: session.finishedAt
-      }).catch(err => console.error('DB Update error:', err));
+        GameSession.findByIdAndUpdate(session._id, {
+          state: 'FINISHED',
+          finishedAt: session.finishedAt
+        }).catch(err => console.error('DB Update error:', err));
 
-      await delRoomCache(gamePin);
+        await delRoomCache(gamePin);
+        delete activeQuizzes[gamePin];
 
-      const finalLeaderboard = [...session.players].sort((a, b) => b.score - a.score);
+        const finalLeaderboard = [...session.players].sort((a, b) => b.score - a.score);
 
-      io.to(`room:${gamePin}`).emit('game_over', {
-        leaderboard: finalLeaderboard.map((p, idx) => ({
-          rank: idx + 1,
-          nickname: p.nickname,
-          avatar: p.avatar,
-          score: p.score
-        }))
-      });
-    } else {
-      session.state = 'SCOREBOARD';
-      
-      // Update DB in background
-      GameSession.findByIdAndUpdate(session._id, { state: 'SCOREBOARD' }).catch(err => console.error('DB Update error:', err));
-      
-      // Update cache
-      await setRoomCache(gamePin, session);
+        io.to(`room:${gamePin}`).emit('game_over', {
+          leaderboard: finalLeaderboard.map((p, idx) => ({
+            rank: idx + 1,
+            nickname: p.nickname,
+            avatar: p.avatar,
+            score: p.score
+          }))
+        });
+      } else {
+        session.state = 'SCOREBOARD';
 
-      const currentLeaderboard = [...session.players].sort((a, b) => b.score - a.score);
+        // Update DB in background
+        GameSession.findByIdAndUpdate(session._id, { state: 'SCOREBOARD' }).catch(err => console.error('DB Update error:', err));
 
-      io.to(`room:${gamePin}`).emit('question_ended', {
-        correctOption: currentQuestion.correctOption,
-        leaderboard: currentLeaderboard.map((p: any, idx) => ({
-          rank: idx + 1,
-          nickname: p.nickname,
-          avatar: p.avatar,
-          score: p.score,
-          isCorrect: p.answers.find((ans: any) => ans.questionIndex === session.currentQuestionIndex)?.isCorrect || false
-        }))
-      });
-    }
+        // Update cache
+        await setRoomCache(gamePin, session);
+
+        const currentLeaderboard = [...session.players].sort((a, b) => b.score - a.score);
+
+        io.to(`room:${gamePin}`).emit('question_ended', {
+          correctOption: currentQuestion.correctOption,
+          leaderboard: currentLeaderboard.map((p: any, idx) => ({
+            rank: idx + 1,
+            nickname: p.nickname,
+            avatar: p.avatar,
+            score: p.score,
+            isCorrect: p.answers.find((ans: any) => ans.questionIndex === session.currentQuestionIndex)?.isCorrect || false
+          }))
+        });
+      }
+    });
   } catch (err) {
     console.error('Error ending question:', err);
   }

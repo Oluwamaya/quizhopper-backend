@@ -52,7 +52,15 @@ const io = new Server(server, {
     origin: corsOriginCheck,
     methods: ['GET', 'POST'],
     credentials: true
-  }
+  },
+  // Default Socket.IO timing (25s ping interval + 20s ping timeout) can take
+  // up to ~45s to notice a dead connection — too slow for an 8-20s question
+  // timer, where players would appear "stuck" long after their wifi actually
+  // dropped. Tightened so a truly dead connection surfaces as disconnected
+  // within ~20s, without being so aggressive that normal network jitter on
+  // shared school/church wifi causes false-positive drops.
+  pingInterval: 10000,
+  pingTimeout: 10000
 });
 
 // Bind socketio instance to Express App so controllers can access it

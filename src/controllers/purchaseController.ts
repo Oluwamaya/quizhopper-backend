@@ -134,6 +134,17 @@ export const getSellerDashboard = async (req: AuthRequest, res: Response) => {
 
     const totalCount = await QuizPurchase.countDocuments({ quiz: { $in: quizIds } });
 
+    // Lifetime coins earned from sales — computed from the actual purchase
+    // records (sellers keep 100% of pricePaid), not from the live coins
+    // balance. The balance also moves from hosting spend, quiz purchases,
+    // and deposits, so it can't double as an "earnings" figure — this sum
+    // only ever grows, matching what's shown in the sales history below.
+    const earningsAgg = await QuizPurchase.aggregate([
+      { $match: { quiz: { $in: quizIds } } },
+      { $group: { _id: null, total: { $sum: '$pricePaid' } } }
+    ]);
+    const totalCoinsEarned = earningsAgg.length > 0 ? earningsAgg[0].total : 0;
+
     // Retrieve a page of sales transactions for these quizzes
     const salesTransactions = await QuizPurchase.find({ quiz: { $in: quizIds } })
       .populate('buyer', 'displayName email')
@@ -156,7 +167,7 @@ export const getSellerDashboard = async (req: AuthRequest, res: Response) => {
     return res.status(200).json({
       success: true,
       stats: {
-        balance: seller.balance,
+        totalCoinsEarned,
         salesCount: seller.salesCount,
         publishedQuizzesCount: sellerQuizzes.length
       },
