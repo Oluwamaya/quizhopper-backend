@@ -4,12 +4,19 @@ import { User } from '../models/User';
 import { WalletTransaction } from '../models/WalletTransaction';
 import { AuthRequest } from '../middlewares/authMiddleware';
 import { env } from '../config/env';
+import { getCache, acquireOnce } from '../services/redisService';
 
 const PAYSTACK_SECRET_KEY = env.PAYSTACK_SECRET_KEY;
 const PAYSTACK_PUBLIC_KEY = env.PAYSTACK_PUBLIC_KEY;
 
-// Set of processed reference IDs to prevent duplicate credits
-const processedReferences = new Set<string>();
+// Idempotency guard for processed payment references — Redis-backed (with
+// in-memory fallback) so it's shared across instances instead of living on
+// whichever single process happened to handle the request. This is a fast
+// dedup guard; the WalletTransaction.reference unique DB index below is the
+// actual correctness guarantee if this check is ever bypassed (e.g. a
+// Redis outage falling back to a fresh local cache on a new instance).
+const REFERENCE_TTL_SECONDS = 7 * 24 * 60 * 60; // 7 days
+const referenceCacheKey = (reference: string) => `paystack:ref:${reference}`;
 
 // 1. Initialize Paystack Transaction
 export const initializePaystackDeposit = async (req: AuthRequest, res: Response) => {
@@ -88,7 +95,8 @@ export const verifyPaystackDeposit = async (req: AuthRequest, res: Response) => 
       return res.status(400).json({ success: false, message: 'Transaction reference is required' });
     }
 
-    if (processedReferences.has(reference)) {
+    const alreadyProcessed = await getCache(referenceCacheKey(reference));
+    if (alreadyProcessed) {
       const user = await User.findById(userId);
       return res.status(200).json({
         success: true,
@@ -142,12 +150,15 @@ export const verifyPaystackDeposit = async (req: AuthRequest, res: Response) => 
       return res.status(403).json({ success: false, message: 'This transaction does not belong to your account.' });
     }
 
-    processedReferences.add(reference);
+    // Atomically claim this reference — if another concurrent request (or
+    // another instance) already claimed it, fall back to the DB unique
+    // index below rather than crediting twice.
+    await acquireOnce(referenceCacheKey(reference), REFERENCE_TTL_SECONDS);
 
     // Record the ledger entry first — `reference` has a unique index, so a
     // duplicate-credit race is rejected here at the database layer even if
-    // the in-memory idempotency set were ever bypassed (e.g. process
-    // restart). Only credit the balance once the ledger write succeeds.
+    // the idempotency guard above were ever bypassed (e.g. a Redis outage).
+    // Only credit the balance once the ledger write succeeds.
     try {
       await WalletTransaction.create({
         user: userId,
@@ -228,8 +239,12 @@ export const handlePaystackWebhook = async (req: Request, res: Response) => {
       const userId = event.data.metadata?.userId;
       const amountNaira = Number(event.data.amount) / 100;
 
-      if (ref && userId && Number.isFinite(amountNaira) && amountNaira > 0 && !processedReferences.has(ref)) {
-        processedReferences.add(ref);
+      const claimed =
+        ref && userId && Number.isFinite(amountNaira) && amountNaira > 0
+          ? await acquireOnce(referenceCacheKey(ref), REFERENCE_TTL_SECONDS)
+          : false;
+
+      if (claimed) {
         try {
           await WalletTransaction.create({
             user: userId,

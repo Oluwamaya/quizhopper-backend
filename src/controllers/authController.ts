@@ -8,6 +8,7 @@ import { getGlobalConfig } from '../models/AppConfig';
 import { registerSubscription } from '../services/pushService';
 import { AuthRequest } from '../middlewares/authMiddleware';
 import { env } from '../config/env';
+import { setCache, getCache, deleteCache } from '../services/redisService';
 
 const JWT_SECRET = env.JWT_SECRET;
 const CLIENT_URL = env.CLIENT_URL;
@@ -17,9 +18,8 @@ const isPasswordStrongEnough = (password: string): boolean => {
   return typeof password === 'string' && password.length >= 8;
 };
 
-// Transient memory-store for mock password reset tokens
-// Key: resetToken, Value: { email, expires }
-const resetTokensStore = new Map<string, { email: string; expires: number }>();
+const RESET_TOKEN_TTL_SECONDS = 3600; // 1 hour
+const resetTokenCacheKey = (token: string) => `pwreset:${token}`;
 
 // Helper to generate and set JWT token
 const sendTokenResponse = (user: any, statusCode: number, res: Response) => {
@@ -305,11 +305,11 @@ export const forgotPassword = async (req: Request, res: Response) => {
       return res.status(200).json(genericResponse);
     }
 
-    // Generate token
+    // Generate token — stored in Redis (shared across instances) with a
+    // native TTL, instead of an in-memory Map that would only exist on
+    // whichever instance handled this request.
     const resetToken = crypto.randomBytes(32).toString('hex');
-    const expires = Date.now() + 3600000; // 1 hour expiration
-
-    resetTokensStore.set(resetToken, { email: user.email, expires });
+    await setCache(resetTokenCacheKey(resetToken), user.email, RESET_TOKEN_TTL_SECONDS);
 
     const resetLink = `${CLIENT_URL}/reset-password?token=${resetToken}`;
     console.log('\n======================================================');
@@ -337,21 +337,21 @@ export const resetPassword = async (req: Request, res: Response) => {
       return res.status(400).json({ success: false, message: 'Token and new password are required' });
     }
 
-    const tokenDetails = resetTokensStore.get(token);
-    if (!tokenDetails) {
+    const email = await getCache(resetTokenCacheKey(token));
+    if (!email) {
       return res.status(400).json({ success: false, message: 'Invalid or expired password reset token' });
-    }
-
-    if (Date.now() > tokenDetails.expires) {
-      resetTokensStore.delete(token);
-      return res.status(400).json({ success: false, message: 'Password reset token has expired' });
     }
 
     if (!isPasswordStrongEnough(newPassword)) {
       return res.status(400).json({ success: false, message: 'Password must be at least 8 characters long' });
     }
 
-    const user = await User.findOne({ email: tokenDetails.email });
+    // Invalidate the token immediately once it's confirmed valid, before
+    // applying the change — makes it single-use even if two requests race
+    // on the same token.
+    await deleteCache(resetTokenCacheKey(token));
+
+    const user = await User.findOne({ email });
     if (!user) {
       return res.status(404).json({ success: false, message: 'User not found' });
     }
@@ -359,9 +359,6 @@ export const resetPassword = async (req: Request, res: Response) => {
     const salt = await bcrypt.genSalt(10);
     user.password = await bcrypt.hash(newPassword, salt);
     await user.save();
-
-    // Invalidate token
-    resetTokensStore.delete(token);
 
     return res.status(200).json({ success: true, message: 'Password reset successfully. You can now login.' });
   } catch (error: any) {

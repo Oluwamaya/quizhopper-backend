@@ -71,6 +71,81 @@ export const delRoomCache = async (gamePin: string): Promise<void> => {
   }
 };
 
+// Generic key-value cache with TTL, used for state that must be shared
+// across instances if this app is ever scaled horizontally — e.g. password
+// reset tokens and Paystack idempotency flags. Falls back to an in-memory
+// Map (with manually-tracked expiry, since Map has no native TTL) when
+// Redis is unavailable, same fail-safe pattern as the room cache above.
+interface LocalEntry {
+  value: string;
+  expiresAt: number;
+}
+const localKeyValueCache = new Map<string, LocalEntry>();
+
+export const setCache = async (key: string, value: string, ttlSeconds: number): Promise<void> => {
+  try {
+    if (isRedisConnected && redisClient) {
+      await redisClient.set(key, value, 'EX', ttlSeconds);
+      return;
+    }
+  } catch (err) {
+    // fall through to local cache
+  }
+  localKeyValueCache.set(key, { value, expiresAt: Date.now() + ttlSeconds * 1000 });
+};
+
+export const getCache = async (key: string): Promise<string | null> => {
+  try {
+    if (isRedisConnected && redisClient) {
+      return await redisClient.get(key);
+    }
+  } catch (err) {
+    // fall through to local cache
+  }
+  const entry = localKeyValueCache.get(key);
+  if (!entry) return null;
+  if (Date.now() > entry.expiresAt) {
+    localKeyValueCache.delete(key);
+    return null;
+  }
+  return entry.value;
+};
+
+export const deleteCache = async (key: string): Promise<void> => {
+  try {
+    if (isRedisConnected && redisClient) {
+      await redisClient.del(key);
+      return;
+    }
+  } catch (err) {
+    // fall through to local cache
+  }
+  localKeyValueCache.delete(key);
+};
+
+// Atomic "have we seen this key before" check-and-set, used for idempotency
+// guards (e.g. "has this payment reference already been processed?").
+// Uses Redis's SET NX (only set if not already present) so the check and
+// the set happen as one atomic operation — two concurrent requests racing
+// on the same key can't both see "not seen yet". Returns true only for the
+// caller that actually claimed the key.
+export const acquireOnce = async (key: string, ttlSeconds: number): Promise<boolean> => {
+  try {
+    if (isRedisConnected && redisClient) {
+      const result = await redisClient.set(key, '1', 'EX', ttlSeconds, 'NX');
+      return result === 'OK';
+    }
+  } catch (err) {
+    // fall through to local cache
+  }
+  const entry = localKeyValueCache.get(key);
+  if (entry && Date.now() <= entry.expiresAt) {
+    return false;
+  }
+  localKeyValueCache.set(key, { value: '1', expiresAt: Date.now() + ttlSeconds * 1000 });
+  return true;
+};
+
 // Per-room mutex: getRoomCache/setRoomCache are separate read-then-write calls, so two
 // socket handlers racing on the same gamePin (e.g. two players joining in the same
 // instant) could both read the pre-update state and overwrite each other's change —
