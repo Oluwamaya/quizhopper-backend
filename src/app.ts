@@ -19,8 +19,6 @@ import { notFoundHandler, errorHandler } from './middlewares/errorHandler';
 // Initialize passport config
 import './config/passport';
 
-import path from 'path';
-
 // Import routes
 import authRoutes from './routes/authRoutes';
 import quizRoutes from './routes/quizRoutes';
@@ -73,10 +71,10 @@ app.set('trust proxy', 1);
 // Connect to MongoDB database
 connectDB();
 
-// Security headers. This is a JSON API (not server-rendered HTML), and the
-// frontend on a separate origin loads /uploads images directly, so relax the
-// cross-origin-resource-policy default and skip CSP (irrelevant for JSON/API
-// responses and would otherwise need per-frontend tuning).
+// Security headers. This is a JSON API (not server-rendered HTML), so skip
+// CSP (irrelevant for JSON/API responses and would otherwise need
+// per-frontend tuning) and relax cross-origin-resource-policy so the
+// frontend on a separate origin can load API responses without friction.
 app.use(
   helmet({
     contentSecurityPolicy: false,
@@ -151,9 +149,6 @@ app.use(passport.session());
 // Global rate limit across the whole API surface (tighter, route-specific
 // limiters are applied on top of this for sensitive endpoints)
 app.use('/api', generalApiLimiter);
-
-// Serve static uploaded complaint attachments
-app.use('/uploads', express.static(path.join(__dirname, '../public/uploads')));
 
 // Mount API routes
 app.use('/api/auth', authRoutes);

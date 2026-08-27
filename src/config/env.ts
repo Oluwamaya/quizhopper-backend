@@ -65,5 +65,12 @@ export const env = {
   VAPID_EMAIL: process.env.VAPID_EMAIL || 'mailto:admin@quizhopper.com',
 
   REDIS_HOST: process.env.REDIS_HOST || '127.0.0.1',
-  REDIS_PORT: Number(process.env.REDIS_PORT) || 6379
+  REDIS_PORT: Number(process.env.REDIS_PORT) || 6379,
+
+  // Cloudinary object storage for user-uploaded files. Optional —
+  // support-ticket uploads return a 503 if these aren't set rather than
+  // failing the whole app at boot.
+  CLOUDINARY_CLOUD_NAME: process.env.CLOUDINARY_CLOUD_NAME || '',
+  CLOUDINARY_API_KEY: process.env.CLOUDINARY_API_KEY || '',
+  CLOUDINARY_API_SECRET: process.env.CLOUDINARY_API_SECRET || ''
 };

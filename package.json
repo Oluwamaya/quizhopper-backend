@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
+    "cloudinary": "^2.11.0",
     "compression": "^1.8.1",
     "cookie-session": "^2.1.0",
     "cors": "^2.8.5",

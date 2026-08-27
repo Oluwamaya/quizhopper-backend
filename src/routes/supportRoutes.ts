@@ -1,24 +1,26 @@
 import { Router, Response } from 'express';
-import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import { SupportTicket } from '../models/SupportTicket';
 import { protect, AuthRequest } from '../middlewares/authMiddleware';
 import { adminProtect } from '../middlewares/adminMiddleware';
 import { uploadLimiter } from '../middlewares/rateLimiters';
+import { isStorageConfigured, uploadToStorage } from '../services/storageService';
 
 const router = Router();
 
 const GUEST_ID_PATTERN = /^[a-zA-Z0-9_-]{4,64}$/;
 const MAX_UPLOAD_BYTES = 5 * 1024 * 1024; // 5MB
 const ALLOWED_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.pdf']);
-const ALLOWED_MIME_TYPES = new Set([
-  'image/png',
-  'image/jpeg',
-  'image/gif',
-  'image/webp',
-  'application/pdf'
-]);
+const MIME_BY_EXTENSION: Record<string, string> = {
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+  '.pdf': 'application/pdf'
+};
+const ALLOWED_MIME_TYPES = new Set(Object.values(MIME_BY_EXTENSION));
 
 // 1. Get or Create active ticket for guest session
 router.get('/ticket/:guestId', async (req: AuthRequest, res: Response) => {
@@ -51,11 +53,16 @@ router.get('/ticket/:guestId', async (req: AuthRequest, res: Response) => {
   }
 });
 
-// 2. Upload file via base64 encoding (reusing public uploads layout).
+// 2. Upload file via base64 encoding, stored in Cloudinary (not local disk —
+// Render's filesystem is ephemeral and wipes on every restart).
 // Intentionally reachable by anonymous guests (the live support widget has
 // no login requirement), but rate-limited and capped/allow-listed to stop
-// disk-fill DoS and arbitrary file-type uploads.
+// storage-abuse DoS and arbitrary file-type uploads.
 router.post('/upload', uploadLimiter, async (req: AuthRequest, res: Response) => {
+  if (!isStorageConfigured()) {
+    return res.status(503).json({ success: false, message: 'File uploads are not configured. Please contact support.' });
+  }
+
   const { fileName, fileData } = req.body;
   if (!fileName || !fileData || typeof fileName !== 'string' || typeof fileData !== 'string') {
     return res.status(400).json({ success: false, message: 'Missing file metadata or content payload' });
@@ -100,19 +107,24 @@ router.post('/upload', uploadLimiter, async (req: AuthRequest, res: Response) =>
       return res.status(413).json({ success: false, message: 'File exceeds the 5MB upload limit' });
     }
 
-    const uploadDir = path.join(__dirname, '../../public/uploads');
-    if (!fs.existsSync(uploadDir)) {
-      fs.mkdirSync(uploadDir, { recursive: true });
-    }
+    const contentType = (mimeType && ALLOWED_MIME_TYPES.has(mimeType) ? mimeType : MIME_BY_EXTENSION[extension]);
+    const baseName = `${Date.now()}_${crypto.randomUUID()}`;
+    const sanitizedName = `${baseName}${extension}`;
 
-    const sanitizedName = `${Date.now()}_${crypto.randomUUID()}${extension}`;
-    const destinationPath = path.join(uploadDir, sanitizedName);
+    // Images go through Cloudinary's `image` pipeline, which appends its
+    // own detected format to the delivery URL regardless of what's in the
+    // public_id, so the extension is omitted there. PDFs use `raw` (stored
+    // as-is, no conversion) — for `raw`, Cloudinary does NOT auto-append an
+    // extension, so the public_id needs one for the delivered file to
+    // actually carry .pdf.
+    const isPdf = extension === '.pdf';
+    const publicId = isPdf ? `support-uploads/${sanitizedName}` : `support-uploads/${baseName}`;
 
-    fs.writeFileSync(destinationPath, base64Buffer);
+    const url = await uploadToStorage(publicId, base64Buffer, contentType, isPdf ? 'raw' : 'image');
 
     return res.status(200).json({
       success: true,
-      url: `/uploads/${sanitizedName}`,
+      url,
       fileName: sanitizedName
     });
   } catch (err: any) {
