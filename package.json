@@ -3,6 +3,9 @@
   "version": "1.0.0",
   "description": "Quiz Hopper Realtime Game Server",
   "main": "dist/app.js",
+  "engines": {
+    "node": ">=20.0.0"
+  },
   "scripts": {
     "dev": "nodemon src/app.ts",
     "build": "tsc",
