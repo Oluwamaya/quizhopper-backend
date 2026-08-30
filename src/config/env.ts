@@ -55,10 +55,18 @@ export const env = {
   GOOGLE_CLIENT_ID: process.env.GOOGLE_CLIENT_ID || '',
   GOOGLE_CLIENT_SECRET: process.env.GOOGLE_CLIENT_SECRET || '',
 
-  // Paystack keys are only strictly required in production, since dev/test
-  // flows can run without real payment processing configured.
-  PAYSTACK_SECRET_KEY: isProduction ? requireEnv('PAYSTACK_SECRET_KEY', 10) : process.env.PAYSTACK_SECRET_KEY || '',
-  PAYSTACK_PUBLIC_KEY: process.env.PAYSTACK_PUBLIC_KEY || '',
+  // Paystack live/test mode is an explicit switch, independent of NODE_ENV —
+  // this lets the app run in production (NODE_ENV=production, all the
+  // production hardening active) while still safely processing test-mode
+  // payments, until PAYSTACK_LIVE_MODE is deliberately flipped on. Real
+  // money only moves once that flag is true AND the live keys are set.
+  PAYSTACK_LIVE_MODE: process.env.PAYSTACK_LIVE_MODE === 'true',
+  PAYSTACK_SECRET_KEY: process.env.PAYSTACK_LIVE_MODE === 'true'
+    ? requireEnv('PAYSTACK_SECRET_LIVE_KEY', 10)
+    : process.env.PAYSTACK_SECRET_TEST_KEY || '',
+  PAYSTACK_PUBLIC_KEY: process.env.PAYSTACK_LIVE_MODE === 'true'
+    ? requireEnv('PAYSTACK_PUBLIC_LIVE_KEY', 10)
+    : process.env.PAYSTACK_PUBLIC_TEST_KEY || '',
 
   VAPID_PUBLIC_KEY: process.env.VAPID_PUBLIC_KEY || '',
   VAPID_PRIVATE_KEY: process.env.VAPID_PRIVATE_KEY || '',

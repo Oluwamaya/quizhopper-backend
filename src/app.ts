@@ -178,6 +178,14 @@ startSessionCleanupCron(io);
 // Start server
 server.listen(env.PORT, () => {
   console.log(`Quiz Hopper server running in ${env.NODE_ENV} mode on port ${env.PORT}`);
+  // Loud, unmissable boot log for payment mode — this is the one setting
+  // where a silent misconfiguration could mean real money moves (or fails
+  // to) unexpectedly.
+  console.log(
+    env.PAYSTACK_LIVE_MODE
+      ? '*** PAYSTACK: LIVE MODE — real payments will be processed. ***'
+      : 'PAYSTACK: TEST MODE — no real money will move.'
+  );
 });
 
 // Graceful shutdown — stop accepting new connections and close DB/IO cleanly
