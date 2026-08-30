@@ -41,7 +41,12 @@ const corsOriginCheck = (origin: string | undefined, callback: (err: Error | nul
   if (!origin || env.CLIENT_URLS.includes(origin)) {
     return callback(null, true);
   }
-  return callback(new Error('Not allowed by CORS'));
+  // A disallowed origin is an expected, well-defined outcome (403), not a
+  // server malfunction — tagging statusCode here means errorHandler.ts's
+  // generic err.statusCode handling returns the right code automatically.
+  const corsError: any = new Error('Not allowed by CORS');
+  corsError.statusCode = 403;
+  return callback(corsError);
 };
 
 // Configure Sockets with CORS
