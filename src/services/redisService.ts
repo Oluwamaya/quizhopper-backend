@@ -1,4 +1,4 @@
-import Redis from 'ioredis';
+import Redis, { RedisOptions } from 'ioredis';
 import { env } from '../config/env';
 
 let redisClient: Redis | null = null;
@@ -9,13 +9,24 @@ const localCache = new Map<string, any>();
 
 // Initialize Redis Client
 try {
-  // Configured with quick timeout (1.5 seconds) so it doesn't hang the process if Redis is missing
-  redisClient = new Redis({
+  // Configured with quick timeout (1.5 seconds) so it doesn't hang the process if Redis is missing.
+  // password/tls are added only when configured, so local dev (no auth, no
+  // TLS) and managed providers like Upstash (both required) both work
+  // against the same code path without passing empty/meaningless options.
+  const redisOptions: RedisOptions = {
     host: env.REDIS_HOST,
     port: env.REDIS_PORT,
     connectTimeout: 1500,
     maxRetriesPerRequest: 1
-  });
+  };
+  if (env.REDIS_PASSWORD) {
+    redisOptions.password = env.REDIS_PASSWORD;
+  }
+  if (env.REDIS_TLS) {
+    redisOptions.tls = {};
+  }
+
+  redisClient = new Redis(redisOptions);
 
   redisClient.on('connect', () => {
     isRedisConnected = true;

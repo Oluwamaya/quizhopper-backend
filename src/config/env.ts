@@ -74,6 +74,12 @@ export const env = {
 
   REDIS_HOST: process.env.REDIS_HOST || '127.0.0.1',
   REDIS_PORT: Number(process.env.REDIS_PORT) || 6379,
+  // Optional — local dev Redis typically has no password and no TLS.
+  // Managed providers (Upstash, etc.) require both; set REDIS_PASSWORD and
+  // REDIS_TLS=true for those. TLS is an explicit switch rather than being
+  // inferred from the password being set, so behavior is never a surprise.
+  REDIS_PASSWORD: process.env.REDIS_PASSWORD || '',
+  REDIS_TLS: process.env.REDIS_TLS === 'true',
 
   // Cloudinary object storage for user-uploaded files. Optional —
   // support-ticket uploads return a 503 if these aren't set rather than
