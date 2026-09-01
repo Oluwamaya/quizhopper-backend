@@ -9,6 +9,7 @@ import { registerSubscription } from '../services/pushService';
 import { AuthRequest } from '../middlewares/authMiddleware';
 import { env } from '../config/env';
 import { setCache, getCache, deleteCache } from '../services/redisService';
+import { emitAdminTransaction } from '../utils/adminEvents';
 
 const JWT_SECRET = env.JWT_SECRET;
 const CLIENT_URL = env.CLIENT_URL;
@@ -81,6 +82,7 @@ export const register = async (req: Request, res: Response) => {
     const hashedPassword = await bcrypt.hash(password, salt);
 
     const isFirstUser = (await User.countDocuments()) === 0;
+    const config = await getGlobalConfig();
 
     const user = await User.create({
       displayName: displayName.trim(),
@@ -90,8 +92,20 @@ export const register = async (req: Request, res: Response) => {
       isAdmin: isFirstUser,
       isPremium: false,
       balance: 0,
+      coins: config.signupCoinGift,
       salesCount: 0
     });
+
+    if (config.signupCoinGift > 0) {
+      await WalletTransaction.create({
+        user: user._id,
+        type: 'signup_bonus',
+        coinsChange: config.signupCoinGift,
+        amountMoney: 0,
+        description: `Welcome bonus: ${config.signupCoinGift} free hosting coins`,
+        status: 'completed'
+      });
+    }
 
     const token = sendTokenResponse(user, 201, res);
 
@@ -106,6 +120,7 @@ export const register = async (req: Request, res: Response) => {
         isPremium: user.isPremium,
         isAdmin: user.isAdmin,
         balance: user.balance,
+        coins: user.coins,
         salesCount: user.salesCount
       }
     });
@@ -393,6 +408,7 @@ export const devLogin = async (req: Request, res: Response) => {
     let user = await User.findOne({ email: normalizedEmail });
     if (!user) {
       const isFirst = (await User.countDocuments()) === 0;
+      const config = await getGlobalConfig();
       user = await User.create({
         displayName: displayName || normalizedEmail.split('@')[0],
         email: normalizedEmail,
@@ -400,8 +416,20 @@ export const devLogin = async (req: Request, res: Response) => {
         isPremium: false,
         isAdmin: isFirst,
         balance: 0,
+        coins: config.signupCoinGift,
         salesCount: 0
       });
+
+      if (config.signupCoinGift > 0) {
+        await WalletTransaction.create({
+          user: user._id,
+          type: 'signup_bonus',
+          coinsChange: config.signupCoinGift,
+          amountMoney: 0,
+          description: `Welcome bonus: ${config.signupCoinGift} free hosting coins`,
+          status: 'completed'
+        });
+      }
     }
 
     const token = sendTokenResponse(user, 200, res);
@@ -416,6 +444,7 @@ export const devLogin = async (req: Request, res: Response) => {
         isPremium: user.isPremium,
         isAdmin: user.isAdmin,
         balance: user.balance,
+        coins: user.coins,
         salesCount: user.salesCount
       }
     });
@@ -513,7 +542,7 @@ export const buyCoins = async (req: AuthRequest, res: Response) => {
     }
 
     // Log Wallet Transaction
-    await WalletTransaction.create({
+    const txn = await WalletTransaction.create({
       user: user._id,
       type: 'buy_coins',
       amountMoney: -totalCost,
@@ -521,6 +550,7 @@ export const buyCoins = async (req: AuthRequest, res: Response) => {
       description: `Purchased ${amount} Hosting Coins (₦ ${totalCost.toLocaleString()})`,
       status: 'completed'
     });
+    emitAdminTransaction(req.app.get('socketio'), txn);
 
     return res.status(200).json({
       success: true,

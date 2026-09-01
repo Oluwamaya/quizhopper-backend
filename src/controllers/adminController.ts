@@ -3,6 +3,7 @@ import { User } from '../models/User';
 import { Quiz } from '../models/Quiz';
 import { QuizPurchase } from '../models/QuizPurchase';
 import { GameSession } from '../models/GameSession';
+import { WalletTransaction } from '../models/WalletTransaction';
 import { getGlobalConfig } from '../models/AppConfig';
 import { AuthRequest } from '../middlewares/authMiddleware';
 
@@ -25,7 +26,7 @@ export const getAdminConfig = async (req: AuthRequest, res: Response) => {
 // Update global system configuration (commission rate, player limit)
 export const updateAdminConfig = async (req: AuthRequest, res: Response) => {
   try {
-    const { freeTierLimit, extraPlayerCoinCost, coinPrice, quizPriceCoins } = req.body;
+    const { freeTierLimit, extraPlayerCoinCost, coinPrice, quizPriceCoins, signupCoinGift } = req.body;
     const config = await getGlobalConfig();
 
     if (freeTierLimit !== undefined) {
@@ -56,6 +57,13 @@ export const updateAdminConfig = async (req: AuthRequest, res: Response) => {
       config.quizPriceCoins = quizPriceCoins;
     }
 
+    if (signupCoinGift !== undefined) {
+      if (signupCoinGift < 0 || signupCoinGift > 1000) {
+        return res.status(400).json({ success: false, message: 'Signup coin gift must be between 0 and 1000' });
+      }
+      config.signupCoinGift = signupCoinGift;
+    }
+
     config.updatedAt = new Date();
     await config.save();
 
@@ -79,6 +87,22 @@ export const getPlatformStats = async (req: AuthRequest, res: Response) => {
     const activeSessions = await GameSession.countDocuments({ state: { $ne: 'FINISHED' } });
     const totalFinishedGames = await GameSession.countDocuments({ state: 'FINISHED' });
 
+    // Lifetime coins ever credited platform-wide (signups, marketplace sales,
+    // coin purchases) — a sales-awareness figure, distinct from any single
+    // user's current spendable balance which fluctuates as coins get spent.
+    const coinsAgg = await WalletTransaction.aggregate([
+      { $match: { coinsChange: { $gt: 0 }, status: 'completed' } },
+      { $group: { _id: null, total: { $sum: '$coinsChange' } } }
+    ]);
+    const totalCoinsAccumulated = coinsAgg.length > 0 ? coinsAgg[0].total : 0;
+
+    // Lifetime real money deposited via Paystack.
+    const depositAgg = await WalletTransaction.aggregate([
+      { $match: { type: 'deposit', status: 'completed' } },
+      { $group: { _id: null, total: { $sum: '$amountMoney' } } }
+    ]);
+    const totalMoneyDeposited = depositAgg.length > 0 ? depositAgg[0].total : 0;
+
     return res.status(200).json({
       success: true,
       stats: {
@@ -87,7 +111,9 @@ export const getPlatformStats = async (req: AuthRequest, res: Response) => {
         totalPurchases,
         totalVolumeCoins,
         activeSessions,
-        totalFinishedGames
+        totalFinishedGames,
+        totalCoinsAccumulated,
+        totalMoneyDeposited
       }
     });
   } catch (error: any) {
@@ -231,6 +257,39 @@ export const broadcastAnnouncement = async (req: AuthRequest, res: Response) => 
     });
 
     return res.status(200).json({ success: true, message: 'Broadcast announcement dispatched successfully' });
+  } catch (error: any) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// Retrieve every wallet transaction platform-wide (coin purchases, Paystack
+// deposits, marketplace sales, etc.), paginated, newest first, with the
+// owning user's identity attached so the admin can see who did what.
+export const getAllTransactions = async (req: AuthRequest, res: Response) => {
+  try {
+    const page = Math.max(1, parseInt(req.query.page as string, 10) || 1);
+    const limit = Math.min(50, Math.max(1, parseInt(req.query.limit as string, 10) || 10));
+    const typeFilter = typeof req.query.type === 'string' && req.query.type !== 'all' ? req.query.type : undefined;
+
+    const filter: any = {};
+    if (typeFilter) filter.type = typeFilter;
+
+    const totalCount = await WalletTransaction.countDocuments(filter);
+
+    const transactions = await WalletTransaction.find(filter)
+      .populate('user', 'displayName email')
+      .sort({ createdAt: -1 })
+      .skip((page - 1) * limit)
+      .limit(limit);
+
+    return res.status(200).json({
+      success: true,
+      transactions,
+      page,
+      limit,
+      totalCount,
+      totalPages: Math.max(1, Math.ceil(totalCount / limit))
+    });
   } catch (error: any) {
     return res.status(500).json({ success: false, message: error.message });
   }

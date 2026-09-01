@@ -1,6 +1,8 @@
 import passport from 'passport';
 import { Strategy as GoogleStrategy } from 'passport-google-oauth20';
 import { User } from '../models/User';
+import { WalletTransaction } from '../models/WalletTransaction';
+import { getGlobalConfig } from '../models/AppConfig';
 import { env } from './env';
 
 const GOOGLE_CLIENT_ID = env.GOOGLE_CLIENT_ID;
@@ -30,6 +32,7 @@ if (GOOGLE_CLIENT_ID && GOOGLE_CLIENT_SECRET) {
               }
               await user.save();
             } else {
+              const config = await getGlobalConfig();
               user = await User.create({
                 displayName: profile.displayName || profile.emails?.[0].value.split('@')[0] || 'User',
                 email: profile.emails?.[0].value || '',
@@ -37,8 +40,20 @@ if (GOOGLE_CLIENT_ID && GOOGLE_CLIENT_SECRET) {
                 avatarUrl: profile.photos?.[0].value || '',
                 isPremium: false,
                 balance: 0,
+                coins: config.signupCoinGift,
                 salesCount: 0
               });
+
+              if (config.signupCoinGift > 0) {
+                await WalletTransaction.create({
+                  user: user._id,
+                  type: 'signup_bonus',
+                  coinsChange: config.signupCoinGift,
+                  amountMoney: 0,
+                  description: `Welcome bonus: ${config.signupCoinGift} free hosting coins`,
+                  status: 'completed'
+                });
+              }
             }
           }
           return done(null, user);

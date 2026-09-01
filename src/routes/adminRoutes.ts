@@ -1,12 +1,13 @@
 import { Router } from 'express';
-import { 
-  getAdminConfig, 
-  updateAdminConfig, 
-  getPlatformStats, 
-  getPlatformUsers, 
+import {
+  getAdminConfig,
+  updateAdminConfig,
+  getPlatformStats,
+  getPlatformUsers,
   getPlatformUserDetail,
-  updateUserStatus, 
-  broadcastAnnouncement 
+  updateUserStatus,
+  broadcastAnnouncement,
+  getAllTransactions
 } from '../controllers/adminController';
 import { protect } from '../middlewares/authMiddleware';
 import { adminProtect } from '../middlewares/adminMiddleware';
@@ -30,5 +31,8 @@ router.post('/user/update', updateUserStatus);
 
 // System-wide socket announcement endpoint
 router.post('/broadcast', broadcastAnnouncement);
+
+// Platform-wide wallet transaction history (paginated)
+router.get('/transactions', getAllTransactions);
 
 export default router;

@@ -5,6 +5,7 @@ import { User } from '../models/User';
 import { WalletTransaction } from '../models/WalletTransaction';
 import { getGlobalConfig } from '../models/AppConfig';
 import { AuthRequest } from '../middlewares/authMiddleware';
+import { emitAdminTransaction } from '../utils/adminEvents';
 
 // Purchase a quiz using Coins
 export const purchaseQuiz = async (req: AuthRequest, res: Response) => {
@@ -74,8 +75,10 @@ export const purchaseQuiz = async (req: AuthRequest, res: Response) => {
       throw err;
     }
 
+    const io = req.app.get('socketio');
+
     // Log buyer coin deduction
-    await WalletTransaction.create({
+    const buyerTxn = await WalletTransaction.create({
       user: buyerId,
       type: 'marketplace_buy',
       coinsChange: -costInCoins,
@@ -83,6 +86,7 @@ export const purchaseQuiz = async (req: AuthRequest, res: Response) => {
       description: `Unlocked quiz deck "${quiz.title}"`,
       status: 'completed'
     });
+    emitAdminTransaction(io, buyerTxn);
 
     // 4. Distribute seller coin earnings — the seller keeps 100% of the
     // coin price; the platform takes no cut on marketplace quiz sales.
@@ -94,7 +98,7 @@ export const purchaseQuiz = async (req: AuthRequest, res: Response) => {
           salesCount: 1
         }
       });
-      await WalletTransaction.create({
+      const sellerTxn = await WalletTransaction.create({
         user: quiz.creator,
         type: 'marketplace_sale',
         coinsChange: sellerEarn,
@@ -102,6 +106,7 @@ export const purchaseQuiz = async (req: AuthRequest, res: Response) => {
         description: `Marketplace sale credit for "${quiz.title}"`,
         status: 'completed'
       });
+      emitAdminTransaction(io, sellerTxn);
     }
 
     return res.status(201).json({

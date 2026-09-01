@@ -5,6 +5,7 @@ import { WalletTransaction } from '../models/WalletTransaction';
 import { AuthRequest } from '../middlewares/authMiddleware';
 import { env } from '../config/env';
 import { getCache, acquireOnce } from '../services/redisService';
+import { emitAdminTransaction } from '../utils/adminEvents';
 
 const PAYSTACK_SECRET_KEY = env.PAYSTACK_SECRET_KEY;
 const PAYSTACK_PUBLIC_KEY = env.PAYSTACK_PUBLIC_KEY;
@@ -160,7 +161,7 @@ export const verifyPaystackDeposit = async (req: AuthRequest, res: Response) => 
     // the idempotency guard above were ever bypassed (e.g. a Redis outage).
     // Only credit the balance once the ledger write succeeds.
     try {
-      await WalletTransaction.create({
+      const txn = await WalletTransaction.create({
         user: userId,
         type: 'deposit',
         amountMoney: verifiedAmountNaira,
@@ -169,6 +170,7 @@ export const verifyPaystackDeposit = async (req: AuthRequest, res: Response) => 
         reference,
         status: 'completed'
       });
+      emitAdminTransaction(req.app.get('socketio'), txn);
     } catch (err: any) {
       if (err.code === 11000) {
         const user = await User.findById(userId);
@@ -246,7 +248,7 @@ export const handlePaystackWebhook = async (req: Request, res: Response) => {
 
       if (claimed) {
         try {
-          await WalletTransaction.create({
+          const txn = await WalletTransaction.create({
             user: userId,
             type: 'deposit',
             amountMoney: amountNaira,
@@ -255,6 +257,7 @@ export const handlePaystackWebhook = async (req: Request, res: Response) => {
             reference: ref,
             status: 'completed'
           });
+          emitAdminTransaction(req.app.get('socketio'), txn);
           await User.findByIdAndUpdate(userId, { $inc: { balance: amountNaira } });
           console.log(`WEBHOOK SUCCESS: ₦ ${amountNaira} credited to user ${userId}`);
         } catch (err: any) {

@@ -7,6 +7,7 @@ import { GameSession } from '../models/GameSession';
 import { WalletTransaction } from '../models/WalletTransaction';
 import { setRoomCache, getRoomCache, delRoomCache, withRoomLock } from '../services/redisService';
 import { env } from '../config/env';
+import { emitAdminTransaction } from '../utils/adminEvents';
 
 const JWT_SECRET = env.JWT_SECRET;
 
@@ -105,7 +106,7 @@ export const setupGameSockets = (io: Server) => {
             return socket.emit('error', { message: `Insufficient coins. This tier requires ${coinCost} coins.` });
           }
           user = deducted;
-          await WalletTransaction.create({
+          const txn = await WalletTransaction.create({
             user: socket.userId,
             type: 'host_game',
             coinsChange: -coinCost,
@@ -113,6 +114,7 @@ export const setupGameSockets = (io: Server) => {
             description: `Hosted game session for "${quiz.title}" (${playerLimit} players)`,
             status: 'completed'
           });
+          emitAdminTransaction(io, txn);
         }
 
         // Create the session
