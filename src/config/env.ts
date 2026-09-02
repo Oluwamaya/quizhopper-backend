@@ -68,6 +68,11 @@ export const env = {
     ? requireEnv('PAYSTACK_PUBLIC_LIVE_KEY', 10)
     : process.env.PAYSTACK_PUBLIC_TEST_KEY || '',
 
+  // Optional — routes deposit payments to a Paystack subaccount for split
+  // settlement. Leave unset to keep depositing straight into the main
+  // Paystack account (existing behavior).
+  SUBACCOUNT_CODE: process.env.SUBACCOUNT_CODE || '',
+
   VAPID_PUBLIC_KEY: process.env.VAPID_PUBLIC_KEY || '',
   VAPID_PRIVATE_KEY: process.env.VAPID_PRIVATE_KEY || '',
   VAPID_EMAIL: process.env.VAPID_EMAIL || 'mailto:admin@quizhopper.com',

@@ -37,7 +37,7 @@ export const initializePaystackDeposit = async (req: AuthRequest, res: Response)
     const reference = `ref_paystack_${Date.now()}_${Math.floor(Math.random() * 10000)}`;
     const amountInKobo = Math.round(amount * 100);
 
-    const paystackPayload = {
+    const paystackPayload: Record<string, any> = {
       email: user.email,
       amount: amountInKobo,
       currency: 'NGN',
@@ -48,6 +48,16 @@ export const initializePaystackDeposit = async (req: AuthRequest, res: Response)
         displayName: user.displayName
       }
     };
+
+    // Route settlement to the configured subaccount when set. The
+    // subaccount itself is configured on Paystack's side with
+    // percentage_charge: 0, so no transaction_charge/split percentage is
+    // needed here — bearer: 'subaccount' just makes the subaccount (rather
+    // than the main account) responsible for Paystack's transaction fees.
+    if (env.SUBACCOUNT_CODE) {
+      paystackPayload.subaccount = env.SUBACCOUNT_CODE;
+      paystackPayload.bearer = 'subaccount';
+    }
 
     // Make API call to Paystack API
     const response = await fetch('https://api.paystack.co/transaction/initialize', {
