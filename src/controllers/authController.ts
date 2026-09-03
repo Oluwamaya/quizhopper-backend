@@ -160,6 +160,7 @@ export const login = async (req: Request, res: Response) => {
         isPremium: user.isPremium,
         isAdmin: user.isAdmin,
         balance: user.balance,
+        coins: user.coins || 0,
         salesCount: user.salesCount
       }
     });
@@ -203,6 +204,7 @@ export const adminLogin = async (req: Request, res: Response) => {
         isPremium: user.isPremium,
         isAdmin: user.isAdmin,
         balance: user.balance,
+        coins: user.coins || 0,
         salesCount: user.salesCount
       }
     });
@@ -258,6 +260,7 @@ export const updateProfile = async (req: AuthRequest, res: Response) => {
         isPremium: user.isPremium,
         isAdmin: user.isAdmin,
         balance: user.balance,
+        coins: user.coins || 0,
         salesCount: user.salesCount
       }
     });
