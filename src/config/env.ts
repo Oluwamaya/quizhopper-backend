@@ -91,5 +91,9 @@ export const env = {
   // failing the whole app at boot.
   CLOUDINARY_CLOUD_NAME: process.env.CLOUDINARY_CLOUD_NAME || '',
   CLOUDINARY_API_KEY: process.env.CLOUDINARY_API_KEY || '',
-  CLOUDINARY_API_SECRET: process.env.CLOUDINARY_API_SECRET || ''
+  CLOUDINARY_API_SECRET: process.env.CLOUDINARY_API_SECRET || '',
+
+  // Anthropic (Claude) API for AI quiz generation. Optional — the feature
+  // returns a 503 if this isn't set rather than failing the whole app at boot.
+  ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY || ''
 };

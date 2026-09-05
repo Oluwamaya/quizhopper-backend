@@ -12,7 +12,8 @@ export const getHostingPricing = async (req: AuthRequest, res: Response) => {
       pricing: {
         freeTierLimit: config.freeTierLimit,
         extraPlayerCoinCost: config.extraPlayerCoinCost,
-        coinPrice: config.coinPrice
+        coinPrice: config.coinPrice,
+        aiGenerationCoinCost: config.aiGenerationCoinCost
       }
     });
   } catch (error: any) {

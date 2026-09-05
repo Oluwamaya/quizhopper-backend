@@ -7,6 +7,7 @@ export interface IAppConfig extends Document {
   coinPrice: number; // exchange rate of 1 coin in currency (e.g. 200 or 1.00)
   quizPriceCoins: number; // default price of marketplace quizzes in coins (e.g. 5)
   signupCoinGift: number; // coins automatically granted to every new user on signup (e.g. 10)
+  aiGenerationCoinCost: number; // coins charged per AI quiz generation (e.g. 5)
   updatedAt: Date;
 }
 
@@ -17,6 +18,7 @@ const AppConfigSchema = new Schema<IAppConfig>({
   coinPrice: { type: Number, default: 200 },
   quizPriceCoins: { type: Number, default: 5 },
   signupCoinGift: { type: Number, default: 10 },
+  aiGenerationCoinCost: { type: Number, default: 5 },
   updatedAt: { type: Date, default: Date.now }
 });
 
@@ -32,7 +34,8 @@ export const getGlobalConfig = async (): Promise<IAppConfig> => {
       extraPlayerCoinCost: 2,
       coinPrice: 200,
       quizPriceCoins: 5,
-      signupCoinGift: 10
+      signupCoinGift: 10,
+      aiGenerationCoinCost: 5
     });
   }
   return config;

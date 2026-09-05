@@ -39,3 +39,14 @@ export const paystackLimiter = rateLimit({
   legacyHeaders: false,
   message: { success: false, message: 'Too many wallet requests. Please try again later.' }
 });
+
+// AI quiz generation — each request costs real money against the Anthropic
+// API on top of the coin charge, so this stays tight regardless of a user's
+// coin balance.
+export const aiGenerationLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: 'Too many AI generation requests. Please try again later.' }
+});

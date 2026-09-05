@@ -1,6 +1,7 @@
 import { Server } from 'socket.io';
 import { GameSession } from '../models/GameSession';
 import { delRoomCache } from './redisService';
+import { clearRoomMemory } from '../sockets/gameSocket';
 
 export const startSessionCleanupCron = (io: Server) => {
   console.log('[Cron] Session cleanup scheduler initialized. Scanning every 5 minutes.');
@@ -37,8 +38,11 @@ export const startSessionCleanupCron = (io: Server) => {
           session.finishedAt = now;
           await session.save();
 
-          // Delete from Redis cache
+          // Delete from Redis cache and this process's in-memory room caches —
+          // without this, every abandoned lobby/match the cron force-closes
+          // would leave its quiz + session data sitting in memory forever.
           await delRoomCache(session.gamePin);
+          clearRoomMemory(session.gamePin);
 
           // Evict all sockets in that room
           io.to(`room:${session.gamePin}`).emit('room_closed', {

@@ -27,6 +27,71 @@ const activeTimers: { [gamePin: string]: NodeJS.Timeout } = {};
 // The quiz never changes mid-game, so it's fetched once and reused.
 const activeQuizzes: { [gamePin: string]: any } = {};
 
+// In-memory cache of each active room's live session state — the same
+// reasoning as activeQuizzes above, applied to the session document itself.
+// player_join_lobby and player_submit_answer both run their read-modify-write
+// inside withRoomLock, so every AWAITED Redis round-trip in there multiplies
+// directly into how long the whole queue of concurrent players waits (measured:
+// with 100 players, awaiting a Redis get+set per answer serialized out to
+// 60-75+ seconds per question and climbing, since the cached payload grows
+// every question). Once a room is warm here, reads never hit Redis at all,
+// and writes are fired off without being awaited — Redis stays a resilience
+// checkpoint (still authoritative for reconnect/restart), not a per-message
+// blocking dependency. Safe because this app runs as a single instance; if
+// it's ever horizontally scaled, this cache needs to become instance-shared.
+const activeSessions: { [gamePin: string]: any } = {};
+
+// Reads the live session for a room, preferring the in-memory cache (always
+// current within this process) over Redis/Mongo, and warms the cache on a
+// cold read so subsequent calls in the same room skip the network entirely.
+const getActiveSession = async (gamePin: string, requiredState?: string): Promise<any | null> => {
+  if (activeSessions[gamePin]) {
+    return activeSessions[gamePin];
+  }
+  let session = await getRoomCache(gamePin);
+  if (!session) {
+    const query: any = { gamePin };
+    if (requiredState) query.state = requiredState;
+    const dbSession = await GameSession.findOne(query);
+    if (dbSession) session = dbSession.toObject();
+  }
+  if (session) {
+    activeSessions[gamePin] = session;
+  }
+  return session;
+};
+
+// Updates the in-memory session cache and fires off a Redis checkpoint write
+// without awaiting it — callers inside withRoomLock must not block the lock
+// queue on a network round-trip. Mongo remains the durable record (already
+// written separately, also non-blocking) and Redis remains the cross-restart
+// checkpoint; the in-memory cache is what every read in this process actually
+// uses while the room is active.
+const syncSession = (gamePin: string, session: any) => {
+  activeSessions[gamePin] = session;
+  setRoomCache(gamePin, session).catch((err) => console.error(`Redis checkpoint failed for room:${gamePin}:`, err));
+};
+
+const clearActiveSession = (gamePin: string) => {
+  delete activeSessions[gamePin];
+};
+
+// Clears every in-memory trace of a room: the session cache, the quiz cache,
+// and any pending question timer. Every place a room can end — the game
+// finishing normally, the host closing it, or the inactivity cron force-closing
+// an abandoned lobby/match — must call this, or that room's entry (quiz
+// document, growing player/answers list) sits in process memory forever until
+// the next restart, since these maps are private module state the cron has no
+// other way to reach.
+export const clearRoomMemory = (gamePin: string) => {
+  clearActiveSession(gamePin);
+  delete activeQuizzes[gamePin];
+  if (activeTimers[gamePin]) {
+    clearTimeout(activeTimers[gamePin]);
+    delete activeTimers[gamePin];
+  }
+};
+
 export const setupGameSockets = (io: Server) => {
   // Socket auth middleware
   io.use((socket: AuthenticatedSocket, next) => {
@@ -130,8 +195,10 @@ export const setupGameSockets = (io: Server) => {
         });
 
         const sessionObj = session.toObject();
-        // Seed cache
+        // Seed cache — awaited here since it's once per lobby, not once per
+        // player action, so blocking briefly is fine.
         await setRoomCache(gamePin, sessionObj);
+        activeSessions[gamePin] = sessionObj;
         activeQuizzes[gamePin] = quiz;
 
         socket.join(`room:${gamePin}`);
@@ -153,15 +220,11 @@ export const setupGameSockets = (io: Server) => {
     // Host changes lobby background music
     socket.on('host_change_lobby_music', async ({ gamePin, lobbyMusic }: { gamePin: string; lobbyMusic: string }) => {
       try {
-        let session = await getRoomCache(gamePin);
-        if (!session) {
-          const dbSession = await GameSession.findOne({ gamePin });
-          if (dbSession) session = dbSession.toObject();
-        }
+        const session = await getActiveSession(gamePin);
         if (!session) return;
 
         session.lobbyMusic = lobbyMusic;
-        await setRoomCache(gamePin, session);
+        syncSession(gamePin, session);
 
         // Broadcast to all players in the lobby room
         io.to(`room:${gamePin}`).emit('lobby_music_changed', { lobbyMusic });
@@ -173,12 +236,7 @@ export const setupGameSockets = (io: Server) => {
     // 2. Host starts the game
     socket.on('host_start_game', async ({ gamePin, backgroundMusic }: { gamePin: string; backgroundMusic?: string }) => {
       try {
-        // Read from Cache first, fall back to DB
-        let session = await getRoomCache(gamePin);
-        if (!session) {
-          session = await GameSession.findOne({ gamePin, state: 'LOBBY' });
-          if (session) session = session.toObject();
-        }
+        const session = await getActiveSession(gamePin, 'LOBBY');
 
         if (!session) {
           return socket.emit('error', { message: 'Lobby not found or already started' });
@@ -202,8 +260,12 @@ export const setupGameSockets = (io: Server) => {
           backgroundMusic: session.backgroundMusic
         }).catch(err => console.error('DB Update error:', err));
 
-        // Update cache
-        await setRoomCache(gamePin, session);
+        // Update cache. Non-blocking: even once-per-question writes shouldn't
+        // block the response on a network round-trip — measured on a 100-player
+        // room, the payload itself (all players' accumulated answers) grows
+        // large enough over a long quiz that a single blocking write here
+        // still added a real, growing delay between questions.
+        syncSession(gamePin, session);
 
         const quiz = await Quiz.findById(session.quiz);
         if (!quiz || quiz.questions.length === 0) {
@@ -239,11 +301,7 @@ export const setupGameSockets = (io: Server) => {
     // 3. Host advances to next question
     socket.on('host_next_question', async ({ gamePin }: { gamePin: string }) => {
       try {
-        let session = await getRoomCache(gamePin);
-        if (!session) {
-          session = await GameSession.findOne({ gamePin, state: 'SCOREBOARD' });
-          if (session) session = session.toObject();
-        }
+        const session = await getActiveSession(gamePin, 'SCOREBOARD');
 
         if (!session) {
           return socket.emit('error', { message: 'Game session must be showing the scoreboard to advance' });
@@ -270,7 +328,7 @@ export const setupGameSockets = (io: Server) => {
           }).catch(err => console.error('DB Update error:', err));
 
           await delRoomCache(gamePin);
-          delete activeQuizzes[gamePin];
+          clearRoomMemory(gamePin);
 
           const finalLeaderboard = [...session.players].sort((a, b) => b.score - a.score);
 
@@ -294,7 +352,11 @@ export const setupGameSockets = (io: Server) => {
             questionActiveSince: session.questionActiveSince
           }).catch(err => console.error('DB Update error:', err));
 
-          await setRoomCache(gamePin, session);
+          // Non-blocking — measured: with 100 players' accumulated answers
+          // in the payload, this single write was still adding a real and
+          // growing delay between questions once awaited, even though it
+          // only fires once per question rather than once per player.
+          syncSession(gamePin, session);
 
           const nextQuestion = quiz.questions[nextIndex];
 
@@ -326,7 +388,7 @@ export const setupGameSockets = (io: Server) => {
 
         // Delete cache
         await delRoomCache(gamePin);
-        delete activeQuizzes[gamePin];
+        clearRoomMemory(gamePin);
 
         // Notify all clients in the room that the room is closed
         io.to(`room:${gamePin}`).emit('room_closed', {
@@ -372,13 +434,7 @@ export const setupGameSockets = (io: Server) => {
         // whichever player's update got overwritten (and letting the room exceed
         // its player cap, since both reads would see it as not-yet-full).
         const result = await withRoomLock(gamePin, async () => {
-          let session = await getRoomCache(gamePin);
-          if (!session) {
-            const dbSession = await GameSession.findOne({ gamePin, state: 'LOBBY' });
-            if (dbSession) {
-              session = dbSession.toObject();
-            }
-          }
+          const session = await getActiveSession(gamePin, 'LOBBY');
 
           if (!session || session.state !== 'LOBBY') {
             return { status: 'error' as const, message: 'Active game lobby not found. Check the Game Pin.' };
@@ -412,8 +468,11 @@ export const setupGameSockets = (io: Server) => {
             $push: { players: newPlayer }
           }).catch((err: any) => console.error('DB Update error:', err));
 
-          // Update Cache
-          await setRoomCache(gamePin, session);
+          // Update in-memory cache immediately, checkpoint Redis in the
+          // background — not awaited, so a burst of 100 players joining at
+          // once doesn't serialize 100 blocking round-trips to Redis one
+          // after another (measured: that alone took up to a minute).
+          syncSession(gamePin, session);
 
           return { status: 'ok' as const, newPlayer, players: session.players };
         });
@@ -458,11 +517,7 @@ export const setupGameSockets = (io: Server) => {
     socket.on('host_remove_player', async ({ gamePin, nickname }: { gamePin: string; nickname: string }) => {
       try {
         const result = await withRoomLock(gamePin, async () => {
-          let session = await getRoomCache(gamePin);
-          if (!session) {
-            const dbSession = await GameSession.findOne({ gamePin, state: 'LOBBY' });
-            if (dbSession) session = dbSession.toObject();
-          }
+          const session = await getActiveSession(gamePin, 'LOBBY');
 
           if (!session) {
             return { status: 'error' as const, message: 'Game session not found' };
@@ -486,7 +541,7 @@ export const setupGameSockets = (io: Server) => {
             { $pull: { players: { nickname } } }
           ).catch((err: any) => console.error('DB Update error:', err));
 
-          await setRoomCache(gamePin, session);
+          syncSession(gamePin, session);
 
           return { status: 'ok' as const, removedPlayer, players: session.players };
         });
@@ -517,8 +572,12 @@ export const setupGameSockets = (io: Server) => {
     });
 
     // Helper to construct snapshot of active game room state for rejoining clients
-    const getRoomStateSnapshot = async (session: any) => {
-      const quiz = await Quiz.findById(session.quiz);
+    const getRoomStateSnapshot = async (session: any, gamePin: string) => {
+      let quiz = activeQuizzes[gamePin];
+      if (!quiz) {
+        quiz = await Quiz.findById(session.quiz);
+        if (quiz) activeQuizzes[gamePin] = quiz;
+      }
       let activeQuestionData = null;
       let secondsRemaining = 0;
 
@@ -560,65 +619,64 @@ export const setupGameSockets = (io: Server) => {
     // 4b. Host re-joins after page refresh/reconnect
     socket.on('host_rejoin', async ({ gamePin }: { gamePin: string }) => {
       try {
-        let session = await getRoomCache(gamePin);
-        if (!session) {
-          const dbSession = await GameSession.findOne({ gamePin });
-          if (dbSession) session = dbSession.toObject();
-        }
-
+        const session = await getActiveSession(gamePin);
         if (!session) return;
 
         socket.join(`room:${gamePin}`);
         console.log(`Host re-joined room:${gamePin}`);
 
-        const roomState = await getRoomStateSnapshot(session);
+        const roomState = await getRoomStateSnapshot(session, gamePin);
         socket.emit('rejoin_success', { roomState });
       } catch (e) {
         console.error('Host rejoin error:', e);
       }
     });
 
-    // 4c. Player re-joins after page refresh/reconnect
+    // 4c. Player re-joins after page refresh/reconnect. Lock-protected like
+    // join/submit-answer — a burst of reconnects (e.g. flaky venue wifi
+    // dropping many phones at once) mutates the same in-memory players
+    // array and needs the same serialization guarantee.
     socket.on('player_rejoin', async ({ gamePin, nickname }: { gamePin: string; nickname: string }) => {
       try {
-        let session = await getRoomCache(gamePin);
-        if (!session) {
-          const dbSession = await GameSession.findOne({ gamePin });
-          if (dbSession) session = dbSession.toObject();
-        }
+        const player = await withRoomLock(gamePin, async () => {
+          const session = await getActiveSession(gamePin);
+          if (!session) return null;
 
-        if (!session) return;
+          const match = session.players.find((p: any) => p.nickname.toLowerCase() === nickname.toLowerCase().trim());
+          if (!match) return null;
 
-        const player = session.players.find((p: any) => p.nickname.toLowerCase() === nickname.toLowerCase().trim());
-        if (player) {
-          player.socketId = socket.id;
-          
+          match.socketId = socket.id;
+
           GameSession.updateOne(
-            { _id: session._id, 'players.nickname': player.nickname },
+            { _id: session._id, 'players.nickname': match.nickname },
             { $set: { 'players.$.socketId': socket.id } }
           ).catch(err => console.error('DB Rejoin Update error:', err));
 
-          await setRoomCache(gamePin, session);
+          syncSession(gamePin, session);
 
-          socket.join(`room:${gamePin}`);
-          console.log(`Player ${nickname} re-joined room:${gamePin} with socket ${socket.id}`);
+          return { nickname: match.nickname, avatar: match.avatar, session };
+        });
 
-          const roomState = await getRoomStateSnapshot(session);
-          socket.emit('rejoin_success', {
-            roomState,
-            player: {
-              nickname: player.nickname,
-              avatar: player.avatar
-            }
-          });
+        if (!player) return;
 
-          io.to(`room:${gamePin}`).emit('lobby_update', {
-            players: session.players.map((p: any) => ({
-              nickname: p.nickname,
-              avatar: p.avatar
-            }))
-          });
-        }
+        socket.join(`room:${gamePin}`);
+        console.log(`Player ${nickname} re-joined room:${gamePin} with socket ${socket.id}`);
+
+        const roomState = await getRoomStateSnapshot(player.session, gamePin);
+        socket.emit('rejoin_success', {
+          roomState,
+          player: {
+            nickname: player.nickname,
+            avatar: player.avatar
+          }
+        });
+
+        io.to(`room:${gamePin}`).emit('lobby_update', {
+          players: player.session.players.map((p: any) => ({
+            nickname: p.nickname,
+            avatar: p.avatar
+          }))
+        });
       } catch (e) {
         console.error('Player rejoin error:', e);
       }
@@ -634,11 +692,7 @@ export const setupGameSockets = (io: Server) => {
         // from the live leaderboard cache (Mongo stays correct via $inc/$push,
         // but the in-memory room state used to broadcast the scoreboard would not).
         const result = await withRoomLock(gamePin, async () => {
-          let session = await getRoomCache(gamePin);
-          if (!session) {
-            const dbSession = await GameSession.findOne({ gamePin, state: 'QUESTION_ACTIVE' });
-            if (dbSession) session = dbSession.toObject();
-          }
+          const session = await getActiveSession(gamePin, 'QUESTION_ACTIVE');
 
           if (!session || session.state !== 'QUESTION_ACTIVE') {
             return { status: 'error' as const, message: 'Game is not accepting answers right now' };
@@ -698,7 +752,13 @@ export const setupGameSockets = (io: Server) => {
             }
           ).catch(err => console.error('DB Update error:', err));
 
-          await setRoomCache(gamePin, session);
+          // No Redis write here on purpose. The in-memory activeSessions cache
+          // is authoritative for every read in this process, and endQuestion /
+          // host_next_question already checkpoint to Redis once per question.
+          // Syncing on every single answer used to fire up to 100 full-session
+          // (and growing) writes per question at remote Upstash — non-blocking,
+          // so they queued up in ioredis faster than the network could drain
+          // them and OOM-crashed the process under 100-player load.
 
           const activeSocketsInRoom = io.sockets.adapter.rooms.get(`room:${gamePin}`);
           const playerSockets = session.players.map((p: any) => p.socketId);
@@ -767,11 +827,7 @@ const endQuestion = async (io: Server, gamePin: string) => {
     // The QUESTION_ACTIVE guard below makes a second, queued-up call a safe
     // no-op once the first call has already transitioned the room's state.
     await withRoomLock(gamePin, async () => {
-      let session = await getRoomCache(gamePin);
-      if (!session) {
-        session = await GameSession.findOne({ gamePin, state: 'QUESTION_ACTIVE' });
-        if (session) session = session.toObject();
-      }
+      const session = await getActiveSession(gamePin, 'QUESTION_ACTIVE');
 
       if (!session || session.state !== 'QUESTION_ACTIVE') return;
 
@@ -795,7 +851,7 @@ const endQuestion = async (io: Server, gamePin: string) => {
         }).catch(err => console.error('DB Update error:', err));
 
         await delRoomCache(gamePin);
-        delete activeQuizzes[gamePin];
+        clearRoomMemory(gamePin);
 
         const finalLeaderboard = [...session.players].sort((a, b) => b.score - a.score);
 
@@ -814,7 +870,7 @@ const endQuestion = async (io: Server, gamePin: string) => {
         GameSession.findByIdAndUpdate(session._id, { state: 'SCOREBOARD' }).catch(err => console.error('DB Update error:', err));
 
         // Update cache
-        await setRoomCache(gamePin, session);
+        syncSession(gamePin, session);
 
         const currentLeaderboard = [...session.players].sort((a, b) => b.score - a.score);
 

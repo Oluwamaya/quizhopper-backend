@@ -2,7 +2,10 @@ import { Response } from 'express';
 import { Quiz } from '../models/Quiz';
 import { QuizPurchase } from '../models/QuizPurchase';
 import { User } from '../models/User';
+import { WalletTransaction } from '../models/WalletTransaction';
+import { getGlobalConfig } from '../models/AppConfig';
 import { AuthRequest } from '../middlewares/authMiddleware';
+import { generateQuizQuestions, isAiGenerationConfigured, QuizDifficulty } from '../services/aiQuizService';
 
 const MAX_TITLE_LENGTH = 120;
 const MAX_DESCRIPTION_LENGTH = 1000;
@@ -248,6 +251,104 @@ export const getQuizById = async (req: AuthRequest, res: Response) => {
     });
 
     return res.status(200).json({ success: true, quiz: sanitizedQuiz });
+  } catch (error: any) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+const MAX_AI_TOPIC_LENGTH = 200;
+const MAX_AI_DESCRIPTION_LENGTH = 1000;
+const MAX_AI_QUESTIONS = 25;
+const AI_DIFFICULTIES: QuizDifficulty[] = ['easy', 'medium', 'hard'];
+
+// Generate a set of quiz questions with AI, charging coins for the
+// generation. Returns the questions to the client to pre-fill the quiz
+// editor — nothing is saved to the DB here, so the user always reviews
+// before publishing.
+export const generateQuizWithAI = async (req: AuthRequest, res: Response) => {
+  try {
+    const { topic, description, numQuestions, difficulty } = req.body;
+    const userId = req.userId;
+
+    if (!topic || typeof topic !== 'string' || !topic.trim() || topic.length > MAX_AI_TOPIC_LENGTH) {
+      return res.status(400).json({ success: false, message: `Topic is required and must be under ${MAX_AI_TOPIC_LENGTH} characters` });
+    }
+    if (description !== undefined && (typeof description !== 'string' || description.length > MAX_AI_DESCRIPTION_LENGTH)) {
+      return res.status(400).json({ success: false, message: `Description must be under ${MAX_AI_DESCRIPTION_LENGTH} characters` });
+    }
+    if (!Number.isInteger(numQuestions) || numQuestions < 1 || numQuestions > MAX_AI_QUESTIONS) {
+      return res.status(400).json({ success: false, message: `Number of questions must be between 1 and ${MAX_AI_QUESTIONS}` });
+    }
+    if (typeof difficulty !== 'string' || !AI_DIFFICULTIES.includes(difficulty as QuizDifficulty)) {
+      return res.status(400).json({ success: false, message: 'Difficulty must be easy, medium, or hard' });
+    }
+
+    if (!isAiGenerationConfigured()) {
+      return res.status(503).json({ success: false, message: 'AI quiz generation is not configured. Please contact support.' });
+    }
+
+    const config = await getGlobalConfig();
+    const cost = config.aiGenerationCoinCost;
+
+    // Atomic conditional deduction — same pattern used for buyCoins/
+    // purchaseQuiz: requiring coins >= cost in the update filter makes the
+    // balance check and the deduction a single atomic operation, so two
+    // concurrent requests can't both pass a stale check and double-spend.
+    const user = await User.findOneAndUpdate(
+      { _id: userId, coins: { $gte: cost } },
+      { $inc: { coins: -cost } },
+      { new: true }
+    );
+
+    if (!user) {
+      const existing = await User.findById(userId).select('coins');
+      if (!existing) {
+        return res.status(404).json({ success: false, message: 'User not found' });
+      }
+      return res.status(400).json({
+        success: false,
+        message: `Insufficient coins. You need ${cost} coins to generate a quiz with AI. Current coins: ${existing.coins}`
+      });
+    }
+
+    const trimmedTopic = topic.trim();
+    const trimmedDescription = typeof description === 'string' ? description.trim() : '';
+
+    let questions;
+    try {
+      questions = await generateQuizQuestions({
+        topic: trimmedTopic,
+        description: trimmedDescription,
+        numQuestions,
+        difficulty: difficulty as QuizDifficulty
+      });
+    } catch (genError: any) {
+      // Never charge for a failed generation — refund immediately.
+      await User.findByIdAndUpdate(userId, { $inc: { coins: cost } });
+      console.error('AI quiz generation failed:', genError);
+      return res.status(502).json({
+        success: false,
+        message: 'AI quiz generation failed. Your coins have been refunded — please try again.'
+      });
+    }
+
+    await WalletTransaction.create({
+      user: userId,
+      type: 'ai_quiz_generation',
+      coinsChange: -cost,
+      amountMoney: 0,
+      description: `AI-generated quiz: "${trimmedTopic}" (${numQuestions} questions, ${difficulty})`,
+      status: 'completed'
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: 'Quiz generated successfully!',
+      topic: trimmedTopic,
+      description: trimmedDescription,
+      questions,
+      remainingCoins: user.coins
+    });
   } catch (error: any) {
     return res.status(500).json({ success: false, message: error.message });
   }

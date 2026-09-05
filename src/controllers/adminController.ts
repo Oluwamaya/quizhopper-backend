@@ -26,7 +26,7 @@ export const getAdminConfig = async (req: AuthRequest, res: Response) => {
 // Update global system configuration (commission rate, player limit)
 export const updateAdminConfig = async (req: AuthRequest, res: Response) => {
   try {
-    const { freeTierLimit, extraPlayerCoinCost, coinPrice, quizPriceCoins, signupCoinGift } = req.body;
+    const { freeTierLimit, extraPlayerCoinCost, coinPrice, quizPriceCoins, signupCoinGift, aiGenerationCoinCost } = req.body;
     const config = await getGlobalConfig();
 
     if (freeTierLimit !== undefined) {
@@ -62,6 +62,13 @@ export const updateAdminConfig = async (req: AuthRequest, res: Response) => {
         return res.status(400).json({ success: false, message: 'Signup coin gift must be between 0 and 1000' });
       }
       config.signupCoinGift = signupCoinGift;
+    }
+
+    if (aiGenerationCoinCost !== undefined) {
+      if (aiGenerationCoinCost < 0 || aiGenerationCoinCost > 1000) {
+        return res.status(400).json({ success: false, message: 'AI generation coin cost must be between 0 and 1000' });
+      }
+      config.aiGenerationCoinCost = aiGenerationCoinCost;
     }
 
     config.updatedAt = new Date();
