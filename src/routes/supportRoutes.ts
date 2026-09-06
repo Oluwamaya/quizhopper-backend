@@ -40,7 +40,7 @@ router.get('/ticket/:guestId', async (req: AuthRequest, res: Response) => {
         guestId,
         displayName,
         messages: [{
-          sender: 'agent',
+          sender: 'admin',
           text: `Hello ${displayName}! Welcome to Mayacode Technologies live support. Please type your complaint or upload your payment screenshots below.`,
           createdAt: new Date()
         }],
