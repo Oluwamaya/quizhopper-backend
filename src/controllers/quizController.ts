@@ -6,6 +6,7 @@ import { WalletTransaction } from '../models/WalletTransaction';
 import { getGlobalConfig } from '../models/AppConfig';
 import { AuthRequest } from '../middlewares/authMiddleware';
 import { generateQuizQuestions, isAiGenerationConfigured, QuizDifficulty } from '../services/aiQuizService';
+import { sendServerError } from '../middlewares/errorHandler';
 
 const MAX_TITLE_LENGTH = 120;
 const MAX_DESCRIPTION_LENGTH = 1000;
@@ -75,7 +76,7 @@ export const createQuiz = async (req: AuthRequest, res: Response) => {
 
     return res.status(201).json({ success: true, quiz });
   } catch (error: any) {
-    return res.status(500).json({ success: false, message: error.message });
+    return sendServerError(res, error, 'createQuiz');
   }
 };
 
@@ -133,7 +134,7 @@ export const editQuiz = async (req: AuthRequest, res: Response) => {
     await quiz.save();
     return res.status(200).json({ success: true, message: 'Quiz updated successfully', quiz });
   } catch (error: any) {
-    return res.status(500).json({ success: false, message: error.message });
+    return sendServerError(res, error, 'editQuiz');
   }
 };
 
@@ -170,7 +171,7 @@ export const deleteQuiz = async (req: AuthRequest, res: Response) => {
     await Quiz.findByIdAndDelete(id);
     return res.status(200).json({ success: true, message: 'Quiz deleted successfully' });
   } catch (error: any) {
-    return res.status(500).json({ success: false, message: error.message });
+    return sendServerError(res, error, 'deleteQuiz');
   }
 };
 
@@ -192,7 +193,7 @@ export const getUserLibrary = async (req: AuthRequest, res: Response) => {
 
     return res.status(200).json({ success: true, count: uniqueLibrary.length, library: uniqueLibrary });
   } catch (error: any) {
-    return res.status(500).json({ success: false, message: error.message });
+    return sendServerError(res, error, 'getUserLibrary');
   }
 };
 
@@ -213,7 +214,7 @@ export const getMarketplaceQuizzes = async (req: AuthRequest, res: Response) => 
 
     return res.status(200).json({ success: true, count: availableMarketplace.length, quizzes: availableMarketplace });
   } catch (error: any) {
-    return res.status(500).json({ success: false, message: error.message });
+    return sendServerError(res, error, 'getMarketplaceQuizzes');
   }
 };
 
@@ -252,7 +253,7 @@ export const getQuizById = async (req: AuthRequest, res: Response) => {
 
     return res.status(200).json({ success: true, quiz: sanitizedQuiz });
   } catch (error: any) {
-    return res.status(500).json({ success: false, message: error.message });
+    return sendServerError(res, error, 'getQuizById');
   }
 };
 
@@ -350,6 +351,6 @@ export const generateQuizWithAI = async (req: AuthRequest, res: Response) => {
       remainingCoins: user.coins
     });
   } catch (error: any) {
-    return res.status(500).json({ success: false, message: error.message });
+    return sendServerError(res, error, 'generateQuizWithAI');
   }
 };

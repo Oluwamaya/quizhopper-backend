@@ -6,6 +6,7 @@ import { protect, AuthRequest } from '../middlewares/authMiddleware';
 import { adminProtect } from '../middlewares/adminMiddleware';
 import { uploadLimiter } from '../middlewares/rateLimiters';
 import { isStorageConfigured, uploadToStorage } from '../services/storageService';
+import { sendServerError } from '../middlewares/errorHandler';
 
 const router = Router();
 
@@ -49,7 +50,7 @@ router.get('/ticket/:guestId', async (req: AuthRequest, res: Response) => {
     }
     return res.status(200).json({ success: true, ticket });
   } catch (err: any) {
-    return res.status(500).json({ success: false, message: err.message });
+    return sendServerError(res, err, 'GET /support/ticket/:guestId');
   }
 });
 
@@ -128,7 +129,7 @@ router.post('/upload', uploadLimiter, async (req: AuthRequest, res: Response) =>
       fileName: sanitizedName
     });
   } catch (err: any) {
-    return res.status(500).json({ success: false, message: err.message });
+    return sendServerError(res, err, 'POST /support/upload');
   }
 });
 
@@ -138,7 +139,7 @@ router.get('/tickets', protect, adminProtect, async (req: AuthRequest, res: Resp
     const tickets = await SupportTicket.find().sort({ updatedAt: -1 });
     return res.status(200).json({ success: true, tickets });
   } catch (err: any) {
-    return res.status(500).json({ success: false, message: err.message });
+    return sendServerError(res, err, 'GET /support/tickets');
   }
 });
 
@@ -156,7 +157,7 @@ router.post('/ticket/:guestId/close', protect, adminProtect, async (req: AuthReq
     }
     return res.status(200).json({ success: true, ticket });
   } catch (err: any) {
-    return res.status(500).json({ success: false, message: err.message });
+    return sendServerError(res, err, 'POST /support/ticket/:guestId/close');
   }
 });
 

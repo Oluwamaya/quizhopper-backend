@@ -10,6 +10,7 @@ import { AuthRequest } from '../middlewares/authMiddleware';
 import { env } from '../config/env';
 import { setCache, getCache, deleteCache } from '../services/redisService';
 import { emitAdminTransaction } from '../utils/adminEvents';
+import { sendServerError } from '../middlewares/errorHandler';
 
 const JWT_SECRET = env.JWT_SECRET;
 const CLIENT_URL = env.CLIENT_URL;
@@ -125,7 +126,7 @@ export const register = async (req: Request, res: Response) => {
       }
     });
   } catch (error: any) {
-    return res.status(500).json({ success: false, message: error.message });
+    return sendServerError(res, error, 'register');
   }
 };
 
@@ -165,7 +166,7 @@ export const login = async (req: Request, res: Response) => {
       }
     });
   } catch (error: any) {
-    return res.status(500).json({ success: false, message: error.message });
+    return sendServerError(res, error, 'login');
   }
 };
 
@@ -209,7 +210,7 @@ export const adminLogin = async (req: Request, res: Response) => {
       }
     });
   } catch (error: any) {
-    return res.status(500).json({ success: false, message: error.message });
+    return sendServerError(res, error, 'adminLogin');
   }
 };
 
@@ -265,7 +266,7 @@ export const updateProfile = async (req: AuthRequest, res: Response) => {
       }
     });
   } catch (error: any) {
-    return res.status(500).json({ success: false, message: error.message });
+    return sendServerError(res, error, 'updateProfile');
   }
 };
 
@@ -299,7 +300,7 @@ export const changePassword = async (req: AuthRequest, res: Response) => {
 
     return res.status(200).json({ success: true, message: 'Password updated successfully' });
   } catch (error: any) {
-    return res.status(500).json({ success: false, message: error.message });
+    return sendServerError(res, error, 'changePassword');
   }
 };
 
@@ -343,7 +344,7 @@ export const forgotPassword = async (req: Request, res: Response) => {
       env.isProduction ? genericResponse : { ...genericResponse, devResetLink: resetLink }
     );
   } catch (error: any) {
-    return res.status(500).json({ success: false, message: error.message });
+    return sendServerError(res, error, 'forgotPassword');
   }
 };
 
@@ -380,7 +381,7 @@ export const resetPassword = async (req: Request, res: Response) => {
 
     return res.status(200).json({ success: true, message: 'Password reset successfully. You can now login.' });
   } catch (error: any) {
-    return res.status(500).json({ success: false, message: error.message });
+    return sendServerError(res, error, 'resetPassword');
   }
 };
 
@@ -452,7 +453,7 @@ export const devLogin = async (req: Request, res: Response) => {
       }
     });
   } catch (error: any) {
-    return res.status(500).json({ success: false, message: error.message });
+    return sendServerError(res, error, 'devLogin');
   }
 };
 
@@ -466,7 +467,7 @@ export const subscribePush = async (req: AuthRequest, res: Response) => {
     await registerSubscription(req.userId!, subscription);
     return res.status(200).json({ success: true, message: 'Push subscription registered successfully' });
   } catch (error: any) {
-    return res.status(500).json({ success: false, message: error.message });
+    return sendServerError(res, error, 'subscribePush');
   }
 };
 
@@ -493,7 +494,7 @@ export const getMe = async (req: AuthRequest, res: Response) => {
       }
     });
   } catch (error: any) {
-    return res.status(500).json({ success: false, message: error.message });
+    return sendServerError(res, error, 'getMe');
   }
 };
 
@@ -571,6 +572,6 @@ export const buyCoins = async (req: AuthRequest, res: Response) => {
       }
     });
   } catch (error: any) {
-    return res.status(500).json({ success: false, message: error.message });
+    return sendServerError(res, error, 'buyCoins');
   }
 };

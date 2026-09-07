@@ -2,6 +2,7 @@ import { Response } from 'express';
 import { GameSession } from '../models/GameSession';
 import { AuthRequest } from '../middlewares/authMiddleware';
 import { getGlobalConfig } from '../models/AppConfig';
+import { sendServerError } from '../middlewares/errorHandler';
 
 // Retrieve current platform pricing: hosting capacity costs and the coin exchange rate
 export const getHostingPricing = async (req: AuthRequest, res: Response) => {
@@ -17,7 +18,7 @@ export const getHostingPricing = async (req: AuthRequest, res: Response) => {
       }
     });
   } catch (error: any) {
-    return res.status(500).json({ success: false, message: error.message });
+    return sendServerError(res, error, 'getHostingPricing');
   }
 };
 
@@ -68,7 +69,7 @@ export const getGameHistory = async (req: AuthRequest, res: Response) => {
       totalPages: Math.max(1, Math.ceil(totalCount / limit))
     });
   } catch (error: any) {
-    return res.status(500).json({ success: false, message: error.message });
+    return sendServerError(res, error, 'getGameHistory');
   }
 };
 
@@ -94,6 +95,6 @@ export const deleteGameHistory = async (req: AuthRequest, res: Response) => {
     await GameSession.findByIdAndDelete(id);
     return res.status(200).json({ success: true, message: 'Session removed from history' });
   } catch (error: any) {
-    return res.status(500).json({ success: false, message: error.message });
+    return sendServerError(res, error, 'deleteGameHistory');
   }
 };

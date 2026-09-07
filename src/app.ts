@@ -169,6 +169,11 @@ app.get('/health', (req, res) => {
   res.status(200).json({ status: 'ok', time: new Date() });
 });
 
+// This is a backend API, not a crawlable site — tell search engines to stay out entirely.
+app.get('/robots.txt', (req, res) => {
+  res.type('text/plain').send('User-agent: *\nDisallow: /\n');
+});
+
 // 404 + centralized error handling (must be mounted last)
 app.use(notFoundHandler);
 app.use(errorHandler);

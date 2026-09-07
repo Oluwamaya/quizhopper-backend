@@ -8,6 +8,7 @@ import { WalletTransaction } from '../models/WalletTransaction';
 import { setRoomCache, getRoomCache, delRoomCache, withRoomLock } from '../services/redisService';
 import { env } from '../config/env';
 import { emitAdminTransaction } from '../utils/adminEvents';
+import { getSafeErrorMessage } from '../middlewares/errorHandler';
 
 const JWT_SECRET = env.JWT_SECRET;
 
@@ -15,6 +16,14 @@ interface AuthenticatedSocket extends Socket {
   userId?: string;
   userEmail?: string;
 }
+
+// Same rationale as sendServerError in errorHandler.ts, applied to socket
+// error emits instead of HTTP responses: log the real exception server-side,
+// only forward a raw message to the client outside production.
+const emitSocketError = (socket: Socket, err: any, context: string) => {
+  console.error(`${context}:`, err);
+  socket.emit('error', { message: getSafeErrorMessage(err, 'Something went wrong. Please try again.') });
+};
 
 // Track active timers by game pin
 const activeTimers: { [gamePin: string]: NodeJS.Timeout } = {};
@@ -213,7 +222,7 @@ export const setupGameSockets = (io: Server) => {
           remainingCoins: user.coins
         });
       } catch (err: any) {
-        socket.emit('error', { message: err.message });
+        emitSocketError(socket, err, 'host_create_lobby');
       }
     });
 
@@ -294,7 +303,7 @@ export const setupGameSockets = (io: Server) => {
         }, 2000);
 
       } catch (err: any) {
-        socket.emit('error', { message: err.message });
+        emitSocketError(socket, err, 'host_start_game');
       }
     });
 
@@ -372,7 +381,7 @@ export const setupGameSockets = (io: Server) => {
           startCountdown(io, gamePin, nextQuestion.timeLimit);
         }
       } catch (err: any) {
-        socket.emit('error', { message: err.message });
+        emitSocketError(socket, err, 'host_next_question');
       }
     });
 
@@ -415,7 +424,7 @@ export const setupGameSockets = (io: Server) => {
 
         console.log(`Host aborted room:${gamePin}`);
       } catch (err: any) {
-        socket.emit('error', { message: err.message });
+        emitSocketError(socket, err, 'host_close_room');
       }
     });
 
@@ -506,7 +515,7 @@ export const setupGameSockets = (io: Server) => {
           players: playersList
         });
       } catch (err: any) {
-        socket.emit('error', { message: err.message });
+        emitSocketError(socket, err, 'player_join_lobby');
       }
     });
 
@@ -567,7 +576,7 @@ export const setupGameSockets = (io: Server) => {
 
         console.log(`Host removed player "${nickname}" from room:${gamePin}`);
       } catch (err: any) {
-        socket.emit('error', { message: err.message });
+        emitSocketError(socket, err, 'host_remove_player');
       }
     });
 
@@ -786,7 +795,7 @@ export const setupGameSockets = (io: Server) => {
           endQuestion(io, gamePin);
         }
       } catch (err: any) {
-        socket.emit('error', { message: err.message });
+        emitSocketError(socket, err, 'player_submit_answer');
       }
     });
 

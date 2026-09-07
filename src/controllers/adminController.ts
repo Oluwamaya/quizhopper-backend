@@ -6,6 +6,7 @@ import { GameSession } from '../models/GameSession';
 import { WalletTransaction } from '../models/WalletTransaction';
 import { getGlobalConfig } from '../models/AppConfig';
 import { AuthRequest } from '../middlewares/authMiddleware';
+import { sendServerError } from '../middlewares/errorHandler';
 
 // Escape regex metacharacters so user search input is always treated as a
 // literal substring — an unescaped pattern could both cause a NoSQL/ReDoS
@@ -19,7 +20,7 @@ export const getAdminConfig = async (req: AuthRequest, res: Response) => {
     const config = await getGlobalConfig();
     return res.status(200).json({ success: true, config });
   } catch (error: any) {
-    return res.status(500).json({ success: false, message: error.message });
+    return sendServerError(res, error, 'getAdminConfig');
   }
 };
 
@@ -76,7 +77,7 @@ export const updateAdminConfig = async (req: AuthRequest, res: Response) => {
 
     return res.status(200).json({ success: true, message: 'Settings updated successfully', config });
   } catch (error: any) {
-    return res.status(500).json({ success: false, message: error.message });
+    return sendServerError(res, error, 'updateAdminConfig');
   }
 };
 
@@ -124,7 +125,7 @@ export const getPlatformStats = async (req: AuthRequest, res: Response) => {
       }
     });
   } catch (error: any) {
-    return res.status(500).json({ success: false, message: error.message });
+    return sendServerError(res, error, 'getPlatformStats');
   }
 };
 
@@ -147,7 +148,7 @@ export const getPlatformUsers = async (req: AuthRequest, res: Response) => {
     const users = await User.find(query).sort({ createdAt: -1 });
     return res.status(200).json({ success: true, count: users.length, users });
   } catch (error: any) {
-    return res.status(500).json({ success: false, message: error.message });
+    return sendServerError(res, error, 'getPlatformUsers');
   }
 };
 
@@ -196,7 +197,7 @@ export const getPlatformUserDetail = async (req: AuthRequest, res: Response) => 
       }
     });
   } catch (error: any) {
-    return res.status(500).json({ success: false, message: error.message });
+    return sendServerError(res, error, 'getPlatformUserDetail');
   }
 };
 
@@ -238,7 +239,7 @@ export const updateUserStatus = async (req: AuthRequest, res: Response) => {
 
     return res.status(200).json({ success: true, message: 'User updated successfully', user });
   } catch (error: any) {
-    return res.status(500).json({ success: false, message: error.message });
+    return sendServerError(res, error, 'updateUserStatus');
   }
 };
 
@@ -265,7 +266,7 @@ export const broadcastAnnouncement = async (req: AuthRequest, res: Response) => 
 
     return res.status(200).json({ success: true, message: 'Broadcast announcement dispatched successfully' });
   } catch (error: any) {
-    return res.status(500).json({ success: false, message: error.message });
+    return sendServerError(res, error, 'broadcastAnnouncement');
   }
 };
 
@@ -298,6 +299,6 @@ export const getAllTransactions = async (req: AuthRequest, res: Response) => {
       totalPages: Math.max(1, Math.ceil(totalCount / limit))
     });
   } catch (error: any) {
-    return res.status(500).json({ success: false, message: error.message });
+    return sendServerError(res, error, 'getAllTransactions');
   }
 };

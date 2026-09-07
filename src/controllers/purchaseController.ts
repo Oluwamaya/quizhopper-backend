@@ -6,6 +6,7 @@ import { WalletTransaction } from '../models/WalletTransaction';
 import { getGlobalConfig } from '../models/AppConfig';
 import { AuthRequest } from '../middlewares/authMiddleware';
 import { emitAdminTransaction } from '../utils/adminEvents';
+import { sendServerError } from '../middlewares/errorHandler';
 
 // Purchase a quiz using Coins
 export const purchaseQuiz = async (req: AuthRequest, res: Response) => {
@@ -116,7 +117,7 @@ export const purchaseQuiz = async (req: AuthRequest, res: Response) => {
       remainingCoins: buyer.coins
     });
   } catch (error: any) {
-    return res.status(500).json({ success: false, message: error.message });
+    return sendServerError(res, error, 'purchaseQuiz');
   }
 };
 
@@ -183,7 +184,7 @@ export const getSellerDashboard = async (req: AuthRequest, res: Response) => {
       totalPages: Math.max(1, Math.ceil(totalCount / limit))
     });
   } catch (error: any) {
-    return res.status(500).json({ success: false, message: error.message });
+    return sendServerError(res, error, 'getSellerDashboard');
   }
 };
 
@@ -210,6 +211,6 @@ export const getPurchaseHistory = async (req: AuthRequest, res: Response) => {
 
     return res.status(200).json({ success: true, count: history.length, history });
   } catch (error: any) {
-    return res.status(500).json({ success: false, message: error.message });
+    return sendServerError(res, error, 'getPurchaseHistory');
   }
 };

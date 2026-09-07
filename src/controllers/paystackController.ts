@@ -6,6 +6,7 @@ import { AuthRequest } from '../middlewares/authMiddleware';
 import { env } from '../config/env';
 import { getCache, acquireOnce } from '../services/redisService';
 import { emitAdminTransaction } from '../utils/adminEvents';
+import { sendServerError, getSafeErrorMessage } from '../middlewares/errorHandler';
 
 const PAYSTACK_SECRET_KEY = env.PAYSTACK_SECRET_KEY;
 const PAYSTACK_PUBLIC_KEY = env.PAYSTACK_PUBLIC_KEY;
@@ -92,7 +93,7 @@ export const initializePaystackDeposit = async (req: AuthRequest, res: Response)
       publicKey: PAYSTACK_PUBLIC_KEY
     });
   } catch (error: any) {
-    return res.status(500).json({ success: false, message: error.message });
+    return sendServerError(res, error, 'initializePaystackDeposit');
   }
 };
 
@@ -211,7 +212,7 @@ export const verifyPaystackDeposit = async (req: AuthRequest, res: Response) => 
       }
     });
   } catch (error: any) {
-    return res.status(500).json({ success: false, message: error.message });
+    return sendServerError(res, error, 'verifyPaystackDeposit');
   }
 };
 
@@ -278,7 +279,8 @@ export const handlePaystackWebhook = async (req: Request, res: Response) => {
 
     return res.status(200).json({ status: 'success' });
   } catch (error: any) {
-    return res.status(500).send(error.message);
+    console.error('handlePaystackWebhook:', error);
+    return res.status(500).send(getSafeErrorMessage(error));
   }
 };
 
@@ -305,6 +307,6 @@ export const getWalletTransactions = async (req: AuthRequest, res: Response) => 
       totalPages: Math.max(1, Math.ceil(totalCount / limit))
     });
   } catch (error: any) {
-    return res.status(500).json({ success: false, message: error.message });
+    return sendServerError(res, error, 'getWalletTransactions');
   }
 };

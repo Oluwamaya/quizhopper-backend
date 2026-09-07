@@ -1,6 +1,7 @@
 import { Response, NextFunction } from 'express';
 import { User } from '../models/User';
 import { AuthRequest } from './authMiddleware';
+import { sendServerError } from './errorHandler';
 
 export const adminProtect = async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
@@ -10,6 +11,6 @@ export const adminProtect = async (req: AuthRequest, res: Response, next: NextFu
     }
     next();
   } catch (error: any) {
-    return res.status(500).json({ success: false, message: error.message });
+    return sendServerError(res, error, 'adminProtect');
   }
 };

@@ -8,6 +8,23 @@ export const notFoundHandler = (req: Request, res: Response) => {
   res.status(404).json({ success: false, message: 'Resource not found' });
 };
 
+// Raw exception messages (Mongoose validation strings, driver errors, etc.)
+// can reveal schema/field names and internal implementation details, so they
+// should only reach the client in non-production. Controllers/sockets that
+// catch their own errors (instead of calling next(err)) need this same rule
+// applied manually — this is the shared helper for that.
+export const getSafeErrorMessage = (err: any, fallback = 'Internal server error'): string => {
+  return env.isProduction ? fallback : (err?.message || fallback);
+};
+
+// Logs the real error server-side and responds with a message safe to expose
+// to the client — for the many controllers that catch their own errors rather
+// than calling next(err) into the centralized handler below.
+export const sendServerError = (res: Response, err: any, context: string) => {
+  console.error(`${context}:`, err);
+  return res.status(500).json({ success: false, message: getSafeErrorMessage(err) });
+};
+
 export const errorHandler = (err: any, req: Request, res: Response, next: NextFunction) => {
   if (res.headersSent) {
     return next(err);
