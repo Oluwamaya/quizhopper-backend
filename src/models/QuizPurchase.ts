@@ -17,4 +17,9 @@ const QuizPurchaseSchema = new Schema<IQuizPurchase>({
 // Ensure a user can only buy a specific quiz once
 QuizPurchaseSchema.index({ buyer: 1, quiz: 1 }, { unique: true });
 
+// The {buyer, quiz} compound index above can't efficiently serve a
+// quiz-only lookup (quiz isn't the prefix key) — this covers
+// getSellerDashboard's {quiz: {$in: quizIds}} earnings/sales queries.
+QuizPurchaseSchema.index({ quiz: 1 });
+
 export const QuizPurchase = model<IQuizPurchase>('QuizPurchase', QuizPurchaseSchema);

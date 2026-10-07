@@ -64,4 +64,17 @@ const GameSessionSchema = new Schema<IGameSession>({
   finishedAt: { type: Date }
 });
 
+// Covers getGameHistory's exact query shape ({host, state: 'FINISHED'} sorted
+// by finishedAt) in a single index — without it, every hosted-history page
+// view does a full collection scan, which only gets slower as this
+// collection grows (one document per game ever played, across every user).
+GameSessionSchema.index({ host: 1, state: 1, finishedAt: -1 });
+
+// Covers the inactivity cleanup cron's {state: {$ne: 'FINISHED'}} scan,
+// which runs every 5 minutes against the whole collection. As FINISHED
+// sessions accumulate indefinitely (nothing currently purges them), an
+// unindexed scan here gets proportionally slower over the app's lifetime
+// even though the actual non-finished result set stays small.
+GameSessionSchema.index({ state: 1 });
+
 export const GameSession = model<IGameSession>('GameSession', GameSessionSchema);

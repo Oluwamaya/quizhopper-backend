@@ -92,12 +92,33 @@ Difficulty: ${difficulty}`;
 
   const { questions } = response.parsed_output;
 
-  // Defense in depth: the schema guarantees shape, not cross-field
-  // consistency — confirm every correctOption is genuinely one of that
-  // question's own options before this ever reaches the client or DB.
+  // When asked for a topic it won't engage with (e.g. explicit sexual
+  // content), Claude doesn't hard-fail the request — forced into this
+  // response schema, it instead produces a "question" that IS its refusal
+  // text, padded out with filler/duplicate options just to satisfy the
+  // shape (4 distinct options, exactly N questions). That passes the Zod
+  // schema above (correct lengths, correctOption technically matches one
+  // option) while being worthless as a quiz question — and because it
+  // "succeeds", the coin charge was never refunded and the refusal text
+  // got saved as if it were real content. Two checks below catch this
+  // before it ever reaches the client or DB.
+  const REFUSAL_PATTERN = /\b(i can'?t help|i cannot help|i'?m not able to|i'?m unable to|i won'?t|as an ai|i can'?t (create|generate|write|provide)|i cannot (create|generate|write|provide))\b/i;
+
   for (const q of questions) {
     if (!q.options.includes(q.correctOption)) {
       throw new Error('AI generation produced an invalid answer key. Please try again.');
+    }
+
+    // A genuine quiz question never repeats an option — padding with
+    // duplicates (e.g. "N/A", "N/A", "N/A") is the clearest structural
+    // fingerprint of a declined/degenerate response.
+    const normalizedOptions = q.options.map((opt) => opt.trim().toLowerCase());
+    if (new Set(normalizedOptions).size !== normalizedOptions.length) {
+      throw new Error('AI declined to generate content for this topic. Please try a different topic or description.');
+    }
+
+    if (REFUSAL_PATTERN.test(q.question)) {
+      throw new Error('AI declined to generate content for this topic. Please try a different topic or description.');
     }
   }
 

@@ -101,6 +101,48 @@ export const clearRoomMemory = (gamePin: string) => {
   }
 };
 
+// Socket.IO's own `.connected` flag only reflects what its heartbeat has
+// detected SO FAR — a connection that died without a clean close (phone
+// lost signal, wifi dropped) can still read as "connected" for up to the
+// full ping interval + timeout (~20s on this server's config) after it
+// actually died. For deciding whether a nickname can be reclaimed, that's
+// too slow a fallback to lean on alone, so this does a real-time check
+// instead: ping the socket and wait briefly for an actual reply.
+//
+// Deliberately NOT called from inside withRoomLock. A 2.5s wait inside
+// the per-room lock would serialize every other action in that room
+// behind it — exactly the shape of bug that caused the OOM crash during
+// the 100-player load test (a cheap-looking op placed inside the lock
+// turning into a pile-up under load). Callers probe here first, outside
+// any lock, then re-verify the cheap synchronous flag once inside the
+// lock immediately before committing.
+const confirmSocketAlive = async (io: Server, socketId: string): Promise<boolean> => {
+  const target = io.sockets.sockets.get(socketId);
+  if (!target || !target.connected) return false;
+
+  try {
+    const acked = await new Promise<boolean>((resolve) => {
+      target.timeout(2500).emit('presence_check', (err: any) => resolve(!err));
+    });
+    if (acked) return true; // confirmed alive — in practice this is near-instant
+
+    // No ack within 2.5s does NOT prove the connection is dead — on the
+    // congested shared wifi this app actually runs on (church/school events,
+    // many devices on one access point — see the ping/pong timing comment
+    // on the Server() config in app.ts), a genuinely-connected client can
+    // easily take longer than that without being dead. Treating silence
+    // alone as proof of death would let a nickname be reclaimed during
+    // ordinary network jitter — a narrower, timing-based version of the
+    // exact hijack this whole check exists to prevent. So a timeout only
+    // ever defers to Socket.IO's own independent heartbeat verdict, never
+    // substitutes for it: if THAT has also concluded the connection is
+    // gone by now, trust it; if it still says connected, play it safe.
+    return !!io.sockets.sockets.get(socketId)?.connected;
+  } catch {
+    return true; // fail safe: an error probing is not proof of death
+  }
+};
+
 export const setupGameSockets = (io: Server) => {
   // Socket auth middleware
   io.use((socket: AuthenticatedSocket, next) => {
@@ -437,22 +479,83 @@ export const setupGameSockets = (io: Server) => {
           return socket.emit('error', { message: 'Pin, Nickname, and Avatar are required' });
         }
 
+        // Outside the lock, on purpose (see confirmSocketAlive above): if this
+        // nickname currently maps to a socket that LOOKS connected per
+        // Socket.IO's cached heartbeat state, actively confirm that in
+        // real time before ever taking the room lock. Only runs when the
+        // in-memory session is already warm, which it always is for a game
+        // that's actually in progress — the only time it's cold is right
+        // after a server restart before anyone's touched the room yet.
+        const peekSession = activeSessions[gamePin];
+        if (peekSession && peekSession.state !== 'LOBBY') {
+          const trimmedNickname = nickname.trim().toLowerCase();
+          const peekMatch = peekSession.players.find((p: any) => p.nickname.toLowerCase() === trimmedNickname);
+          if (peekMatch) {
+            const stillAlive = await confirmSocketAlive(io, peekMatch.socketId);
+            if (stillAlive) {
+              return socket.emit('join_failed', { message: 'Nickname is already taken by an active player in this game.' });
+            }
+            // Confirmed dead — fall through to the lock below, which
+            // re-checks the cheap synchronous flag fresh immediately
+            // before committing, in case someone else reclaimed the seat
+            // in the moment this probe was in flight.
+          }
+        }
+
         // The read-check-modify-write below must be atomic per room: without the
         // lock, two players joining in the same instant could both read the same
         // pre-join state and each write their own version back, silently dropping
         // whichever player's update got overwritten (and letting the room exceed
         // its player cap, since both reads would see it as not-yet-full).
         const result = await withRoomLock(gamePin, async () => {
-          const session = await getActiveSession(gamePin, 'LOBBY');
+          // Not scoped to LOBBY here — an active game must still be found so
+          // a returning player (matched below) can rejoin after the server
+          // cache is cold (e.g. a restart mid-game), not just while warm.
+          const session = await getActiveSession(gamePin);
 
-          if (!session || session.state !== 'LOBBY') {
+          if (!session) {
             return { status: 'error' as const, message: 'Active game lobby not found. Check the Game Pin.' };
           }
 
-          // Verify nickname is unique in this room
-          const nameExists = session.players.some((p: any) => p.nickname.toLowerCase() === nickname.trim().toLowerCase());
-          if (nameExists) {
-            return { status: 'join_failed' as const, message: 'Nickname is already taken. Try another!' };
+          // A matching nickname already in this room means this is the same
+          // player reconnecting (lost wifi, closed the tab, switched device)
+          // rather than a brand-new join — let them back in regardless of
+          // how far the game has progressed, instead of flatly rejecting
+          // once it's moved past the lobby.
+          const existingPlayer = session.players.find((p: any) => p.nickname.toLowerCase() === nickname.trim().toLowerCase());
+          if (existingPlayer) {
+            if (session.state === 'LOBBY') {
+              // Still pre-game: a name "slot" isn't claimed to a specific
+              // person yet, so two different people typing the same name
+              // is a real collision, not an assumed reconnect.
+              return { status: 'join_failed' as const, message: 'Nickname is already taken. Try another!' };
+            }
+
+            // Security-critical: a nickname can only be reclaimed if that
+            // player's connection is genuinely dead. Without this check,
+            // anyone who knows the game pin could type an active player's
+            // nickname and hijack their seat mid-game — their socketId
+            // would get silently overwritten here, and the real player's
+            // next answer submission would fail since it's matched by
+            // socket.id. A live, connected player's seat is never
+            // reclaimable by someone else, full stop.
+            const currentSocket = io.sockets.sockets.get(existingPlayer.socketId);
+            if (currentSocket && currentSocket.connected) {
+              return { status: 'join_failed' as const, message: 'Nickname is already taken by an active player in this game.' };
+            }
+
+            existingPlayer.socketId = socket.id;
+            GameSession.updateOne(
+              { _id: session._id, 'players.nickname': existingPlayer.nickname },
+              { $set: { 'players.$.socketId': socket.id } }
+            ).catch((err: any) => console.error('DB Rejoin Update error:', err));
+            syncSession(gamePin, session);
+
+            return { status: 'rejoined' as const, session };
+          }
+
+          if (session.state !== 'LOBBY') {
+            return { status: 'error' as const, message: 'This game has already started. Only returning players can rejoin.' };
           }
 
           // Check player count against host's playerLimit tier
@@ -491,6 +594,24 @@ export const setupGameSockets = (io: Server) => {
         }
         if (result.status === 'join_failed') {
           return socket.emit('join_failed', { message: result.message });
+        }
+
+        if (result.status === 'rejoined') {
+          const { session } = result;
+          socket.join(`room:${gamePin}`);
+          console.log(`Player ${nickname} rejoined mid-game room:${gamePin} with socket ${socket.id}`);
+
+          const roomState = await getRoomStateSnapshot(session, gamePin);
+          const rejoinedPlayer = session.players.find((p: any) => p.socketId === socket.id);
+          socket.emit('rejoin_success', {
+            roomState,
+            player: { nickname: rejoinedPlayer.nickname, avatar: rejoinedPlayer.avatar }
+          });
+
+          io.to(`room:${gamePin}`).emit('lobby_update', {
+            players: session.players.map((p: any) => ({ nickname: p.nickname, avatar: p.avatar }))
+          });
+          return;
         }
 
         const { newPlayer, players } = result;
@@ -647,12 +768,30 @@ export const setupGameSockets = (io: Server) => {
     // array and needs the same serialization guarantee.
     socket.on('player_rejoin', async ({ gamePin, nickname }: { gamePin: string; nickname: string }) => {
       try {
+        // Same outside-the-lock real-time probe as player_join_lobby, for
+        // the same reason: a 2.5s wait must never happen while holding
+        // withRoomLock.
+        const peekSession = activeSessions[gamePin];
+        if (peekSession) {
+          const trimmedNickname = nickname.toLowerCase().trim();
+          const peekMatch = peekSession.players.find((p: any) => p.nickname.toLowerCase() === trimmedNickname);
+          if (peekMatch) {
+            const stillAlive = await confirmSocketAlive(io, peekMatch.socketId);
+            if (stillAlive) return; // same as today: a live nickname collision is treated as "not found"
+          }
+        }
+
         const player = await withRoomLock(gamePin, async () => {
           const session = await getActiveSession(gamePin);
           if (!session) return null;
 
           const match = session.players.find((p: any) => p.nickname.toLowerCase() === nickname.toLowerCase().trim());
           if (!match) return null;
+
+          // Same hijack guard as player_join_lobby: never let a nickname be
+          // reclaimed while that player's own connection is still live.
+          const currentSocket = io.sockets.sockets.get(match.socketId);
+          if (currentSocket && currentSocket.connected) return null;
 
           match.socketId = socket.id;
 

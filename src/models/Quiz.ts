@@ -38,4 +38,13 @@ const QuizSchema = new Schema<IQuiz>({
   createdAt: { type: Date, default: Date.now }
 });
 
+// Covers getUserLibrary/getSellerDashboard's {creator: userId} lookups —
+// every host's dashboard load touches this.
+QuizSchema.index({ creator: 1 });
+
+// Covers getMarketplaceQuizzes' {isPublishedToMarketplace: true, creator:
+// {$ne: userId}} browse query — the public catalog, hit on every
+// marketplace page load and only growing as more quizzes get published.
+QuizSchema.index({ isPublishedToMarketplace: 1, creator: 1 });
+
 export const Quiz = model<IQuiz>('Quiz', QuizSchema);
