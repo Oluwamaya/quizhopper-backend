@@ -602,7 +602,13 @@ export const setupGameSockets = (io: Server) => {
           // after another (measured: that alone took up to a minute).
           syncSession(gamePin, session);
 
-          return { status: 'ok' as const, newPlayer, players: session.players, chatEnabled: session.chatEnabled !== false };
+          return {
+            status: 'ok' as const,
+            newPlayer,
+            players: session.players,
+            chatEnabled: session.chatEnabled !== false,
+            chatMessages: session.chatMessages || []
+          };
         });
 
         if (result.status === 'error') {
@@ -630,7 +636,7 @@ export const setupGameSockets = (io: Server) => {
           return;
         }
 
-        const { newPlayer, players, chatEnabled } = result;
+        const { newPlayer, players, chatEnabled, chatMessages } = result;
         socket.join(`room:${gamePin}`);
         console.log(`Player ${nickname} joined room:${gamePin}`);
 
@@ -645,7 +651,8 @@ export const setupGameSockets = (io: Server) => {
           nickname: newPlayer.nickname,
           avatar: newPlayer.avatar,
           players: playersList,
-          chatEnabled
+          chatEnabled,
+          chatMessages
         });
 
         // Broadcast updated players list to room
@@ -819,13 +826,27 @@ export const setupGameSockets = (io: Server) => {
           senderAvatar = player.avatar;
         }
 
-        io.to(`room:${gamePin}`).emit('chat_message_received', {
+        const chatMessage = {
           nickname: senderNickname,
           avatar: senderAvatar,
           isHost,
           text: censorMessage(text.trim()),
           timestamp: Date.now()
-        });
+        };
+
+        // Kept in-memory only (never written to Mongo — see the schema
+        // comment on chatEnabled) so a genuine reconnect (new tab, new
+        // device, cleared storage — not just navigating between the lobby
+        // and game-room screens, which the client's own chat store already
+        // handles) can still catch up on what it missed. This naturally
+        // disappears the moment the room itself closes, since that's
+        // exactly when clearRoomMemory deletes this whole session object.
+        if (!Array.isArray(session.chatMessages)) session.chatMessages = [];
+        session.chatMessages.push(chatMessage);
+        if (session.chatMessages.length > 100) session.chatMessages.shift();
+        syncSession(gamePin, session);
+
+        io.to(`room:${gamePin}`).emit('chat_message_received', chatMessage);
       } catch (err: any) {
         emitSocketError(socket, err, 'chat_message');
       }
@@ -873,7 +894,8 @@ export const setupGameSockets = (io: Server) => {
         players: session.players.map((p: any) => ({ nickname: p.nickname, avatar: p.avatar, mutedInChat: !!p.mutedInChat })),
         activeQuestion: activeQuestionData,
         leaderboard: mappedLeaderboard,
-        chatEnabled: session.chatEnabled !== false
+        chatEnabled: session.chatEnabled !== false,
+        chatMessages: session.chatMessages || []
       };
     };
 
