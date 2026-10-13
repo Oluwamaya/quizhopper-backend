@@ -13,6 +13,7 @@ export interface ISupportTicket extends Document {
   displayName: string;
   messages: IMessage[];
   status: 'open' | 'closed';
+  adminUnread: boolean;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -30,6 +31,10 @@ const SupportTicketSchema = new Schema({
   displayName: { type: String, required: true },
   messages: [MessageSchema],
   status: { type: String, enum: ['open', 'closed'], default: 'open' },
+  // Flipped true whenever the guest sends a message, flipped false when an
+  // admin responds or opens the ticket — drives the admin dashboard's
+  // unread-first sort and badge count.
+  adminUnread: { type: Boolean, default: false }
 }, { timestamps: true });
 
 export const SupportTicket = mongoose.model<ISupportTicket>('SupportTicket', SupportTicketSchema);

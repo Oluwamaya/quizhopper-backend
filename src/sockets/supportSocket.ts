@@ -43,6 +43,39 @@ export const setupSupportSockets = (io: Server) => {
       }
     });
 
+    // 2b. Admin opens a specific ticket in the dashboard — joins that
+    // ticket's room (so this admin receives any live support_message events
+    // for it) and marks it read, so the unread-first sort/badge clears as
+    // soon as the admin actually looks at it.
+    socket.on('support_admin_join', async ({ guestId }: { guestId: string }) => {
+      try {
+        if (!(await isRequestingSocketAnAdmin(socket))) {
+          return socket.emit('error', { message: 'Access denied: admin privileges required' });
+        }
+        if (typeof guestId !== 'string' || !GUEST_ID_PATTERN.test(guestId)) return;
+
+        socket.join(`support:${guestId}`);
+
+        const ticket = await SupportTicket.findOneAndUpdate(
+          { guestId, adminUnread: true },
+          { adminUnread: false },
+          { new: true }
+        );
+        if (ticket) {
+          io.to('support_admins').emit('support_ticket_updated', {
+            guestId,
+            displayName: ticket.displayName,
+            status: ticket.status,
+            adminUnread: ticket.adminUnread,
+            lastMessage: ticket.messages[ticket.messages.length - 1]?.text || '',
+            updatedAt: ticket.updatedAt
+          });
+        }
+      } catch (err) {
+        console.error('Support admin join error:', err);
+      }
+    });
+
     // 3. User sends a complaint or payment issue
     socket.on('support_user_message', async ({ guestId, text, attachmentUrl }: { guestId: string; text: string; attachmentUrl?: string }) => {
       try {
@@ -63,6 +96,7 @@ export const setupSupportSockets = (io: Server) => {
           createdAt: new Date()
         });
         ticket.status = 'open'; // Re-open ticket if it was closed
+        ticket.adminUnread = true;
         await ticket.save();
 
         // Broadcast new message to support room (user + responding admin)
@@ -76,6 +110,7 @@ export const setupSupportSockets = (io: Server) => {
           guestId,
           displayName: ticket.displayName,
           status: ticket.status,
+          adminUnread: ticket.adminUnread,
           lastMessage: trimmedText || 'Uploaded attachment',
           updatedAt: ticket.updatedAt
         });
@@ -107,6 +142,7 @@ export const setupSupportSockets = (io: Server) => {
           attachmentUrl,
           createdAt: new Date()
         });
+        ticket.adminUnread = false;
         await ticket.save();
 
         // Broadcast to support room
@@ -120,6 +156,7 @@ export const setupSupportSockets = (io: Server) => {
           guestId,
           displayName: ticket.displayName,
           status: ticket.status,
+          adminUnread: ticket.adminUnread,
           lastMessage: trimmedText || 'Uploaded attachment',
           updatedAt: ticket.updatedAt
         });

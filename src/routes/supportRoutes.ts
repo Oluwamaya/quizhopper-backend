@@ -133,11 +133,42 @@ router.post('/upload', uploadLimiter, async (req: AuthRequest, res: Response) =>
   }
 });
 
-// 3. Admin-only: Fetch all active support tickets
+// 3. Admin-only: Fetch support tickets, paginated and sorted unread-first
+// (then most recently active). Each ticket's `messages` is projected down
+// to just the last entry — the list view only ever shows a snippet, and
+// with dozens of long-running conversations the full thread history would
+// make this payload unnecessarily heavy. The full thread is fetched
+// separately via GET /ticket/:guestId when an admin opens one.
 router.get('/tickets', protect, adminProtect, async (req: AuthRequest, res: Response) => {
   try {
-    const tickets = await SupportTicket.find().sort({ updatedAt: -1 });
-    return res.status(200).json({ success: true, tickets });
+    const page = Math.max(1, parseInt(req.query.page as string, 10) || 1);
+    const limit = Math.min(50, Math.max(1, parseInt(req.query.limit as string, 10) || 20));
+
+    const [tickets, totalCount, unreadCount] = await Promise.all([
+      SupportTicket.find({}, {
+        guestId: 1,
+        displayName: 1,
+        status: 1,
+        adminUnread: 1,
+        updatedAt: 1,
+        messages: { $slice: -1 }
+      })
+        .sort({ adminUnread: -1, updatedAt: -1 })
+        .skip((page - 1) * limit)
+        .limit(limit),
+      SupportTicket.countDocuments({}),
+      SupportTicket.countDocuments({ status: 'open', adminUnread: true })
+    ]);
+
+    return res.status(200).json({
+      success: true,
+      tickets,
+      page,
+      limit,
+      totalCount,
+      totalPages: Math.max(1, Math.ceil(totalCount / limit)),
+      unreadCount
+    });
   } catch (err: any) {
     return sendServerError(res, err, 'GET /support/tickets');
   }
@@ -158,6 +189,44 @@ router.post('/ticket/:guestId/close', protect, adminProtect, async (req: AuthReq
     return res.status(200).json({ success: true, ticket });
   } catch (err: any) {
     return sendServerError(res, err, 'POST /support/ticket/:guestId/close');
+  }
+});
+
+// 5. Admin-only: Delete a single ticket permanently
+router.delete('/ticket/:guestId', protect, adminProtect, async (req: AuthRequest, res: Response) => {
+  const { guestId } = req.params;
+  if (!GUEST_ID_PATTERN.test(guestId)) {
+    return res.status(400).json({ success: false, message: 'Invalid guest session identifier' });
+  }
+  try {
+    const ticket = await SupportTicket.findOneAndDelete({ guestId });
+    if (!ticket) {
+      return res.status(404).json({ success: false, message: 'Ticket not found' });
+    }
+    const io = req.app.get('socketio');
+    if (io) io.to('support_admins').emit('support_ticket_deleted', { guestId });
+    return res.status(200).json({ success: true });
+  } catch (err: any) {
+    return sendServerError(res, err, 'DELETE /support/ticket/:guestId');
+  }
+});
+
+// 6. Admin-only: Bulk-delete tickets (the list's "select + delete" action)
+router.post('/tickets/bulk-delete', protect, adminProtect, async (req: AuthRequest, res: Response) => {
+  const { guestIds } = req.body;
+  if (!Array.isArray(guestIds) || guestIds.length === 0 || guestIds.length > 200) {
+    return res.status(400).json({ success: false, message: 'guestIds must be a non-empty array of up to 200 ids' });
+  }
+  if (!guestIds.every((id: unknown) => typeof id === 'string' && GUEST_ID_PATTERN.test(id))) {
+    return res.status(400).json({ success: false, message: 'Invalid guest session identifier in list' });
+  }
+  try {
+    const result = await SupportTicket.deleteMany({ guestId: { $in: guestIds } });
+    const io = req.app.get('socketio');
+    if (io) io.to('support_admins').emit('support_tickets_deleted', { guestIds });
+    return res.status(200).json({ success: true, deletedCount: result.deletedCount });
+  } catch (err: any) {
+    return sendServerError(res, err, 'POST /support/tickets/bulk-delete');
   }
 });
 
