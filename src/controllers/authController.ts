@@ -9,7 +9,7 @@ import { registerSubscription } from '../services/pushService';
 import { AuthRequest } from '../middlewares/authMiddleware';
 import { env } from '../config/env';
 import { setCache, getCache, deleteCache } from '../services/redisService';
-import { emitAdminTransaction } from '../utils/adminEvents';
+import { emitAdminTransaction, emitWalletUpdate } from '../utils/adminEvents';
 import { sendServerError } from '../middlewares/errorHandler';
 
 const JWT_SECRET = env.JWT_SECRET;
@@ -555,6 +555,7 @@ export const buyCoins = async (req: AuthRequest, res: Response) => {
       status: 'completed'
     });
     emitAdminTransaction(req.app.get('socketio'), txn);
+    emitWalletUpdate(req.app.get('socketio'), String(user._id), { coins: user.coins, balance: user.balance });
 
     return res.status(200).json({
       success: true,

@@ -7,6 +7,7 @@ import { getGlobalConfig } from '../models/AppConfig';
 import { AuthRequest } from '../middlewares/authMiddleware';
 import { generateQuizQuestions, isAiGenerationConfigured, QuizDifficulty } from '../services/aiQuizService';
 import { sendServerError } from '../middlewares/errorHandler';
+import { emitWalletUpdate } from '../utils/adminEvents';
 
 const MAX_TITLE_LENGTH = 120;
 const MAX_DESCRIPTION_LENGTH = 1000;
@@ -325,7 +326,8 @@ export const generateQuizWithAI = async (req: AuthRequest, res: Response) => {
       });
     } catch (genError: any) {
       // Never charge for a failed generation — refund immediately.
-      await User.findByIdAndUpdate(userId, { $inc: { coins: cost } });
+      const refunded = await User.findByIdAndUpdate(userId, { $inc: { coins: cost } }, { new: true });
+      emitWalletUpdate(req.app.get('socketio'), userId, { coins: refunded?.coins });
       console.error('AI quiz generation failed:', genError);
       return res.status(502).json({
         success: false,
@@ -341,6 +343,7 @@ export const generateQuizWithAI = async (req: AuthRequest, res: Response) => {
       description: `AI-generated quiz: "${trimmedTopic}" (${numQuestions} questions, ${difficulty})`,
       status: 'completed'
     });
+    emitWalletUpdate(req.app.get('socketio'), userId, { coins: user.coins });
 
     return res.status(200).json({
       success: true,

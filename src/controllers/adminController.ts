@@ -7,6 +7,7 @@ import { WalletTransaction } from '../models/WalletTransaction';
 import { getGlobalConfig } from '../models/AppConfig';
 import { AuthRequest } from '../middlewares/authMiddleware';
 import { sendServerError } from '../middlewares/errorHandler';
+import { emitWalletUpdate } from '../utils/adminEvents';
 
 // Escape regex metacharacters so user search input is always treated as a
 // literal substring — an unescaped pattern could both cause a NoSQL/ReDoS
@@ -235,6 +236,13 @@ export const updateUserStatus = async (req: AuthRequest, res: Response) => {
     const user = await User.findByIdAndUpdate(targetUserId, updateFields, { new: true });
     if (!user) {
       return res.status(404).json({ success: false, message: 'Target user not found' });
+    }
+
+    // The admin is the one making this request, not the affected user —
+    // without this push, someone whose balance/coins an admin just changed
+    // wouldn't see it update until their next unrelated refresh.
+    if (balance !== undefined || coins !== undefined) {
+      emitWalletUpdate(req.app.get('socketio'), String(user._id), { coins: user.coins, balance: user.balance });
     }
 
     return res.status(200).json({ success: true, message: 'User updated successfully', user });

@@ -5,7 +5,7 @@ import { WalletTransaction } from '../models/WalletTransaction';
 import { AuthRequest } from '../middlewares/authMiddleware';
 import { env } from '../config/env';
 import { getCache, acquireOnce } from '../services/redisService';
-import { emitAdminTransaction } from '../utils/adminEvents';
+import { emitAdminTransaction, emitWalletUpdate } from '../utils/adminEvents';
 import { sendServerError, getSafeErrorMessage } from '../middlewares/errorHandler';
 
 const PAYSTACK_SECRET_KEY = env.PAYSTACK_SECRET_KEY;
@@ -198,6 +198,7 @@ export const verifyPaystackDeposit = async (req: AuthRequest, res: Response) => 
     }
 
     const updatedUser = await User.findByIdAndUpdate(userId, { $inc: { balance: verifiedAmountNaira } }, { new: true });
+    emitWalletUpdate(req.app.get('socketio'), userId, { coins: updatedUser?.coins, balance: updatedUser?.balance });
 
     return res.status(200).json({
       success: true,
@@ -269,7 +270,11 @@ export const handlePaystackWebhook = async (req: Request, res: Response) => {
             status: 'completed'
           });
           emitAdminTransaction(req.app.get('socketio'), txn);
-          await User.findByIdAndUpdate(userId, { $inc: { balance: amountNaira } });
+          const webhookUser = await User.findByIdAndUpdate(userId, { $inc: { balance: amountNaira } }, { new: true });
+          // The user's own client has no HTTP response to read this from —
+          // Paystack called this webhook directly, not them — so this push
+          // is the only way their wallet updates without them refreshing.
+          emitWalletUpdate(req.app.get('socketio'), userId, { coins: webhookUser?.coins, balance: webhookUser?.balance });
           console.log(`WEBHOOK SUCCESS: ₦ ${amountNaira} credited to user ${userId}`);
         } catch (err: any) {
           if (err.code !== 11000) throw err; // duplicate reference — already credited, ignore

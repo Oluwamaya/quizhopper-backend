@@ -16,6 +16,7 @@ export interface IPlayer {
   score: number;
   answers: IPlayerAnswer[];
   joinedAt: Date;
+  mutedInChat?: boolean;
 }
 
 export interface IGameSession extends Document {
@@ -28,6 +29,9 @@ export interface IGameSession extends Document {
   players: IPlayer[];
   backgroundMusic?: string; // e.g. 'song1.mp3' or 'off'
   playerLimit: number;
+  chatEnabled: boolean; // Host-controlled; defaults on. Chat messages
+                        // themselves are never persisted anywhere — live
+                        // broadcast only — so only this on/off flag lives here.
   createdAt: Date;
   finishedAt?: Date;
 }
@@ -47,7 +51,8 @@ const PlayerSchema = new Schema<IPlayer>({
   avatar: { type: String, required: true },
   score: { type: Number, default: 0 },
   answers: [PlayerAnswerSchema],
-  joinedAt: { type: Date, default: Date.now }
+  joinedAt: { type: Date, default: Date.now },
+  mutedInChat: { type: Boolean, default: false }
 });
 
 const GameSessionSchema = new Schema<IGameSession>({
@@ -60,6 +65,7 @@ const GameSessionSchema = new Schema<IGameSession>({
   players: [PlayerSchema],
   backgroundMusic: { type: String, default: 'off' },
   playerLimit: { type: Number, default: 10 },
+  chatEnabled: { type: Boolean, default: true },
   createdAt: { type: Date, default: Date.now },
   finishedAt: { type: Date }
 });

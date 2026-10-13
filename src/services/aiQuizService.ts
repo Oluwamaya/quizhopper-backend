@@ -60,13 +60,14 @@ Rules you must always follow:
 - Every question must be directly, factually relevant to the given topic and description. Do not include generic, unrelated, or tangential questions.
 - Each question must have exactly 4 distinct answer options.
 - Exactly one of the 4 options must be correct, and "correctOption" must match that option's text verbatim, character for character.
-- The 3 incorrect options must be plausible but clearly wrong to someone who knows the topic — no joke answers, no options that are obviously silly filler.
+- The 3 incorrect options must be real, specific, plausible distractors a knowledgeable person could genuinely be tempted by — not joke answers, not vague filler, and not obviously-wrong options that give the game away on sight.
+- The correct answer must never be identifiable by being longer, more specific, or more detailed than the 3 distractors — keep all 4 options similar in length and style so nothing stands out structurally.
 - Do not repeat questions or rephrase the same fact twice.
 - Do not reveal or hint at the answer within the question text itself.
-- Match question depth and specificity to the requested difficulty:
-  - easy: broadly known facts, suitable for beginners or casual players.
-  - medium: moderately detailed knowledge, requires some familiarity with the topic.
-  - hard: specific, nuanced, or advanced facts that only someone knowledgeable would know.
+- Match question depth and specificity to the requested difficulty — treat these as strict, not a suggestion:
+  - easy: broadly known facts a casual player would know without specialist knowledge.
+  - medium: requires real familiarity with the topic — not obscure, but not common knowledge either. Distractors should be genuinely tempting to someone who only half-remembers the subject.
+  - hard: specific, nuanced facts that only someone with real expertise or deep familiarity would reliably know. Distractors should be the kind of plausible-sounding near-misses that trip up all but the most knowledgeable players — close dates, similar names, related-but-wrong facts. A hard question that most people could still guess correctly has failed the brief.
 - Write questions and options in clear, natural English, each under 150 characters.`;
 
   const userPrompt = `Generate exactly ${numQuestions} multiple-choice quiz questions.
@@ -124,8 +125,23 @@ Difficulty: ${difficulty}`;
 
   return questions.map((q) => ({
     question: q.question,
-    options: q.options,
+    // LLMs reliably favor certain answer positions (first slot being the
+    // most common bias) regardless of prompting — a model-dependent
+    // instruction isn't something to rely on for this. Shuffling here
+    // guarantees a genuinely random position every time; correctOption is
+    // matched by text everywhere downstream (quiz-taking, scoring,
+    // storage), never by index, so reordering options is always safe.
+    options: shuffle(q.options),
     correctOption: q.correctOption,
     timeLimit: TIME_LIMIT_BY_DIFFICULTY[difficulty]
   }));
+};
+
+const shuffle = <T,>(arr: T[]): T[] => {
+  const result = [...arr];
+  for (let i = result.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [result[i], result[j]] = [result[j], result[i]];
+  }
+  return result;
 };

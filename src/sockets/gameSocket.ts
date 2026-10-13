@@ -7,8 +7,9 @@ import { GameSession } from '../models/GameSession';
 import { WalletTransaction } from '../models/WalletTransaction';
 import { setRoomCache, getRoomCache, delRoomCache, withRoomLock } from '../services/redisService';
 import { env } from '../config/env';
-import { emitAdminTransaction } from '../utils/adminEvents';
+import { emitAdminTransaction, emitWalletUpdate } from '../utils/adminEvents';
 import { getSafeErrorMessage } from '../middlewares/errorHandler';
+import { censorMessage, validateChatMessage, isChatRateLimited, clearChatRateLimit } from '../utils/chatModeration';
 
 const JWT_SECRET = env.JWT_SECRET;
 
@@ -162,6 +163,15 @@ export const setupGameSockets = (io: Server) => {
   io.on('connection', (socket: AuthenticatedSocket) => {
     console.log('Client connected:', socket.id);
 
+    // Every authenticated connection joins its own private per-user room,
+    // so any server-side code that changes this user's coins/balance can
+    // push them a live update regardless of which socket/tab they're on —
+    // including cases with no HTTP response to piggyback an update onto,
+    // like a Paystack webhook crediting a deposit asynchronously.
+    if (socket.userId) {
+      socket.join(`user:${socket.userId}`);
+    }
+
     // --- HOST HANDLERS ---
 
     // 1. Host creates a game lobby
@@ -231,6 +241,7 @@ export const setupGameSockets = (io: Server) => {
             status: 'completed'
           });
           emitAdminTransaction(io, txn);
+          emitWalletUpdate(io, socket.userId, { coins: user.coins });
         }
 
         // Create the session
@@ -245,7 +256,11 @@ export const setupGameSockets = (io: Server) => {
           players: []
         });
 
-        const sessionObj = session.toObject();
+        const sessionObj: any = session.toObject();
+        // In-memory/cache-only convenience field (never written to Mongo —
+        // not part of the schema) so chat messages can label the host by
+        // name without a DB lookup on every single message sent.
+        sessionObj.hostDisplayName = user.displayName;
         // Seed cache — awaited here since it's once per lobby, not once per
         // player action, so blocking briefly is fine.
         await setRoomCache(gamePin, sessionObj);
@@ -261,7 +276,8 @@ export const setupGameSockets = (io: Server) => {
           totalQuestions: quiz.questions.length,
           playerLimit,
           coinsDeducted: coinCost,
-          remainingCoins: user.coins
+          remainingCoins: user.coins,
+          chatEnabled: sessionObj.chatEnabled !== false
         });
       } catch (err: any) {
         emitSocketError(socket, err, 'host_create_lobby');
@@ -586,7 +602,7 @@ export const setupGameSockets = (io: Server) => {
           // after another (measured: that alone took up to a minute).
           syncSession(gamePin, session);
 
-          return { status: 'ok' as const, newPlayer, players: session.players };
+          return { status: 'ok' as const, newPlayer, players: session.players, chatEnabled: session.chatEnabled !== false };
         });
 
         if (result.status === 'error') {
@@ -614,7 +630,7 @@ export const setupGameSockets = (io: Server) => {
           return;
         }
 
-        const { newPlayer, players } = result;
+        const { newPlayer, players, chatEnabled } = result;
         socket.join(`room:${gamePin}`);
         console.log(`Player ${nickname} joined room:${gamePin}`);
 
@@ -628,7 +644,8 @@ export const setupGameSockets = (io: Server) => {
           gamePin,
           nickname: newPlayer.nickname,
           avatar: newPlayer.avatar,
-          players: playersList
+          players: playersList,
+          chatEnabled
         });
 
         // Broadcast updated players list to room
@@ -701,6 +718,119 @@ export const setupGameSockets = (io: Server) => {
       }
     });
 
+    // --- IN-GAME CHAT ---
+    // Not wrapped in withRoomLock: this only ever reads `session` (sender
+    // lookup, mute/enabled checks), never mutates it, so there's no
+    // read-modify-write race to guard against — and keeping it lock-free
+    // means a flood of chat messages can never queue up behind, or in
+    // front of, the answer-submission lock that actually needs it.
+
+    // Host turns the room's chat on/off — can be changed from the lobby or
+    // mid-game, not just before starting.
+    socket.on('host_toggle_chat', async ({ gamePin, enabled }: { gamePin: string; enabled: boolean }) => {
+      try {
+        const session = await getActiveSession(gamePin);
+        if (!session) return socket.emit('chat_error', { message: 'Game session not found' });
+        if (!socket.userId || session.host?.toString() !== socket.userId) {
+          return socket.emit('chat_error', { message: 'Only the host can change chat settings' });
+        }
+
+        session.chatEnabled = !!enabled;
+        GameSession.updateOne({ _id: session._id }, { chatEnabled: session.chatEnabled })
+          .catch((err: any) => console.error('DB Update error:', err));
+        syncSession(gamePin, session);
+
+        io.to(`room:${gamePin}`).emit('chat_toggled', { chatEnabled: session.chatEnabled });
+      } catch (err: any) {
+        emitSocketError(socket, err, 'host_toggle_chat');
+      }
+    });
+
+    const setPlayerChatMute = async (
+      socket: AuthenticatedSocket,
+      gamePin: string,
+      nickname: string,
+      muted: boolean
+    ) => {
+      const session = await getActiveSession(gamePin);
+      if (!session) return socket.emit('chat_error', { message: 'Game session not found' });
+      if (!socket.userId || session.host?.toString() !== socket.userId) {
+        return socket.emit('chat_error', { message: 'Only the host can mute or unmute players' });
+      }
+      const player = session.players.find((p: any) => p.nickname === nickname);
+      if (!player) return socket.emit('chat_error', { message: 'Player not found in this session' });
+
+      player.mutedInChat = muted;
+      GameSession.updateOne(
+        { _id: session._id, 'players.nickname': nickname },
+        { $set: { 'players.$.mutedInChat': muted } }
+      ).catch((err: any) => console.error('DB Update error:', err));
+      syncSession(gamePin, session);
+
+      if (player.socketId) {
+        io.sockets.sockets.get(player.socketId)?.emit('chat_mute_status', { muted });
+      }
+      io.to(`room:${gamePin}`).emit('player_mute_changed', { nickname, muted });
+    };
+
+    socket.on('host_mute_player', ({ gamePin, nickname }: { gamePin: string; nickname: string }) => {
+      setPlayerChatMute(socket, gamePin, nickname, true).catch((err) => emitSocketError(socket, err, 'host_mute_player'));
+    });
+
+    socket.on('host_unmute_player', ({ gamePin, nickname }: { gamePin: string; nickname: string }) => {
+      setPlayerChatMute(socket, gamePin, nickname, false).catch((err) => emitSocketError(socket, err, 'host_unmute_player'));
+    });
+
+    // Any player or the host sends a chat message
+    socket.on('chat_message', async ({ gamePin, text }: { gamePin: string; text: string }) => {
+      try {
+        const session = await getActiveSession(gamePin);
+        if (!session) return;
+
+        if (session.chatEnabled === false) {
+          return socket.emit('chat_error', { message: 'Chat is disabled for this game.' });
+        }
+
+        const validationError = validateChatMessage(text);
+        if (validationError) {
+          return socket.emit('chat_error', { message: validationError });
+        }
+
+        if (isChatRateLimited(socket.id)) {
+          return socket.emit('chat_error', { message: 'You are sending messages too quickly. Please slow down.' });
+        }
+
+        let senderNickname: string;
+        let senderAvatar: string | null = null;
+        let isHost = false;
+
+        if (socket.userId && session.host?.toString() === socket.userId) {
+          isHost = true;
+          senderNickname = session.hostDisplayName || 'Host';
+        } else {
+          const player = session.players.find((p: any) => p.socketId === socket.id);
+          if (!player) {
+            return socket.emit('chat_error', { message: 'You are not part of this game session.' });
+          }
+          if (player.mutedInChat) {
+            return socket.emit('chat_error', { message: 'You have been muted by the host and cannot send messages.' });
+          }
+          senderNickname = player.nickname;
+          senderAvatar = player.avatar;
+        }
+
+        io.to(`room:${gamePin}`).emit('chat_message_received', {
+          nickname: senderNickname,
+          avatar: senderAvatar,
+          isHost,
+          text: censorMessage(text.trim()),
+          timestamp: Date.now()
+        });
+      } catch (err: any) {
+        emitSocketError(socket, err, 'chat_message');
+      }
+    });
+
     // Helper to construct snapshot of active game room state for rejoining clients
     const getRoomStateSnapshot = async (session: any, gamePin: string) => {
       let quiz = activeQuizzes[gamePin];
@@ -740,9 +870,10 @@ export const setupGameSockets = (io: Server) => {
         totalQuestions: quiz ? quiz.questions.length : 0,
         quizTitle: quiz ? quiz.title : '',
         lobbyMusic: session.lobbyMusic || 'off',
-        players: session.players.map((p: any) => ({ nickname: p.nickname, avatar: p.avatar })),
+        players: session.players.map((p: any) => ({ nickname: p.nickname, avatar: p.avatar, mutedInChat: !!p.mutedInChat })),
         activeQuestion: activeQuestionData,
-        leaderboard: mappedLeaderboard
+        leaderboard: mappedLeaderboard,
+        chatEnabled: session.chatEnabled !== false
       };
     };
 
@@ -941,6 +1072,7 @@ export const setupGameSockets = (io: Server) => {
     // 6. Handle client disconnect (Survives refreshes - player is not auto-evicted)
     socket.on('disconnect', async () => {
       console.log('Client socket disconnected:', socket.id);
+      clearChatRateLimit(socket.id);
     });
   });
 };

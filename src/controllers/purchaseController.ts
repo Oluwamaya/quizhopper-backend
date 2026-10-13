@@ -5,7 +5,7 @@ import { User } from '../models/User';
 import { WalletTransaction } from '../models/WalletTransaction';
 import { getGlobalConfig } from '../models/AppConfig';
 import { AuthRequest } from '../middlewares/authMiddleware';
-import { emitAdminTransaction } from '../utils/adminEvents';
+import { emitAdminTransaction, emitWalletUpdate } from '../utils/adminEvents';
 import { sendServerError } from '../middlewares/errorHandler';
 
 // Purchase a quiz using Coins
@@ -70,7 +70,8 @@ export const purchaseQuiz = async (req: AuthRequest, res: Response) => {
       });
     } catch (err: any) {
       if (err.code === 11000) {
-        await User.findByIdAndUpdate(buyerId, { $inc: { coins: costInCoins } });
+        const refunded = await User.findByIdAndUpdate(buyerId, { $inc: { coins: costInCoins } }, { new: true });
+        emitWalletUpdate(req.app.get('socketio'), buyerId, { coins: refunded?.coins });
         return res.status(400).json({ success: false, message: 'You have already purchased this quiz' });
       }
       throw err;
@@ -88,17 +89,21 @@ export const purchaseQuiz = async (req: AuthRequest, res: Response) => {
       status: 'completed'
     });
     emitAdminTransaction(io, buyerTxn);
+    emitWalletUpdate(io, buyerId, { coins: buyer.coins });
 
     // 4. Distribute seller coin earnings — the seller keeps 100% of the
     // coin price; the platform takes no cut on marketplace quiz sales.
+    // The seller isn't the one making this request (the buyer is), so the
+    // live push below is the only way their balance updates without them
+    // refreshing — there's no response of theirs to piggyback on.
     if (quiz.creator) {
       const sellerEarn = costInCoins;
-      await User.findByIdAndUpdate(quiz.creator, {
+      const seller = await User.findByIdAndUpdate(quiz.creator, {
         $inc: {
           coins: sellerEarn,
           salesCount: 1
         }
-      });
+      }, { new: true });
       const sellerTxn = await WalletTransaction.create({
         user: quiz.creator,
         type: 'marketplace_sale',
@@ -108,6 +113,7 @@ export const purchaseQuiz = async (req: AuthRequest, res: Response) => {
         status: 'completed'
       });
       emitAdminTransaction(io, sellerTxn);
+      emitWalletUpdate(io, String(quiz.creator), { coins: seller?.coins });
     }
 
     return res.status(201).json({
