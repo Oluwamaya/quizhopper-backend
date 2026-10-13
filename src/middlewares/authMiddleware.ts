@@ -10,6 +10,32 @@ export interface AuthRequest extends Request {
   userEmail?: string;
 }
 
+// Decodes a JWT if one is present, but never rejects the request when it's
+// missing or invalid — for routes anonymous guests can also reach (the
+// support widget), where we want to recognize a logged-in visitor when
+// possible without requiring login.
+export const optionalAuth = async (req: AuthRequest, _res: Response, next: NextFunction) => {
+  let token;
+
+  if (req.headers.authorization && req.headers.authorization.startsWith('Bearer')) {
+    token = req.headers.authorization.split(' ')[1];
+  } else if (req.cookies && req.cookies.token) {
+    token = req.cookies.token;
+  }
+
+  if (token) {
+    try {
+      const decoded = jwt.verify(token, JWT_SECRET) as { id: string; email: string };
+      req.userId = decoded.id;
+      req.userEmail = decoded.email;
+    } catch {
+      // Expired/invalid token on an otherwise-anonymous route — proceed as guest.
+    }
+  }
+
+  next();
+};
+
 export const protect = async (req: AuthRequest, res: Response, next: NextFunction) => {
   let token;
 

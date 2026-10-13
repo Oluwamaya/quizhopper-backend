@@ -21,12 +21,24 @@ const isRequestingSocketAnAdmin = async (socket: AuthenticatedSocket): Promise<b
   return !!user?.isAdmin;
 };
 
+// A logged-in visitor's ticket identity is always their account, never
+// whatever guestId their client happens to send — otherwise stale
+// localStorage from before they logged in (or a guestId typed/forged by
+// someone else) could write into the wrong ticket. Mirrors the same
+// resolution the GET /support/ticket/:guestId REST route uses.
+const resolveGuestId = (socket: AuthenticatedSocket, clientGuestId: unknown): string | null => {
+  if (socket.userId) return `user_${socket.userId}`;
+  if (typeof clientGuestId === 'string' && GUEST_ID_PATTERN.test(clientGuestId)) return clientGuestId;
+  return null;
+};
+
 export const setupSupportSockets = (io: Server) => {
   io.on('connection', (socket: AuthenticatedSocket) => {
     // 1. Client/User joins their support room
     socket.on('support_join', ({ guestId }: { guestId: string }) => {
-      if (typeof guestId !== 'string' || !GUEST_ID_PATTERN.test(guestId)) return;
-      socket.join(`support:${guestId}`);
+      const resolvedId = resolveGuestId(socket, guestId);
+      if (!resolvedId) return;
+      socket.join(`support:${resolvedId}`);
     });
 
     // 2. Admin registers to receive all live support ticket update events.
@@ -77,9 +89,10 @@ export const setupSupportSockets = (io: Server) => {
     });
 
     // 3. User sends a complaint or payment issue
-    socket.on('support_user_message', async ({ guestId, text, attachmentUrl }: { guestId: string; text: string; attachmentUrl?: string }) => {
+    socket.on('support_user_message', async ({ guestId: clientGuestId, text, attachmentUrl }: { guestId: string; text: string; attachmentUrl?: string }) => {
       try {
-        if (typeof guestId !== 'string' || !GUEST_ID_PATTERN.test(guestId)) return;
+        const guestId = resolveGuestId(socket, clientGuestId);
+        if (!guestId) return;
         if (text !== undefined && typeof text !== 'string') return;
         if (attachmentUrl !== undefined && typeof attachmentUrl !== 'string') return;
         if (!text && !attachmentUrl) return;

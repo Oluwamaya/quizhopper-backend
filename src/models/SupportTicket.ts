@@ -11,6 +11,12 @@ export interface ISupportTicket extends Document {
   guestId: string;
   userId?: mongoose.Types.ObjectId;
   displayName: string;
+  // Only set for anonymous visitors (a compulsory step before they can
+  // start chatting) — logged-in users are identified by userId instead, so
+  // this stays undefined for them. Gives admins a durable way to follow up
+  // if the guest loses the browser-local identity their chat normally
+  // resumes from.
+  email?: string;
   messages: IMessage[];
   status: 'open' | 'closed';
   adminUnread: boolean;
@@ -29,6 +35,7 @@ const SupportTicketSchema = new Schema({
   guestId: { type: String, required: true, unique: true },
   userId: { type: Schema.Types.ObjectId, ref: 'User' },
   displayName: { type: String, required: true },
+  email: { type: String, maxlength: 254 },
   messages: [MessageSchema],
   status: { type: String, enum: ['open', 'closed'], default: 'open' },
   // Flipped true whenever the guest sends a message, flipped false when an
