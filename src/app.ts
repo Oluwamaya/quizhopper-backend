@@ -14,6 +14,7 @@ import { env } from './config/env';
 import { connectDB } from './config/db';
 import { startSessionCleanupCron } from './services/cronService';
 import { generalApiLimiter } from './middlewares/rateLimiters';
+import { blockAiScrapersAndCloners, apiHardeningHeaders } from './middlewares/securityMiddleware';
 import { notFoundHandler, errorHandler } from './middlewares/errorHandler';
 
 // Initialize passport config
@@ -27,6 +28,7 @@ import gameRoutes from './routes/gameRoutes';
 import adminRoutes from './routes/adminRoutes';
 import supportRoutes from './routes/supportRoutes';
 import paystackRoutes from './routes/paystackRoutes';
+import jackpotRoutes from './routes/jackpotRoutes';
 
 // Import socket setup
 import { setupGameSockets } from './sockets/gameSocket';
@@ -151,6 +153,10 @@ app.use(
 app.use(passport.initialize());
 app.use(passport.session());
 
+// Anti-scraper / anti-AI-crawler guard & security headers
+app.use(apiHardeningHeaders);
+app.use(blockAiScrapersAndCloners);
+
 // Global rate limit across the whole API surface (tighter, route-specific
 // limiters are applied on top of this for sensitive endpoints)
 app.use('/api', generalApiLimiter);
@@ -163,6 +169,7 @@ app.use('/api/games', gameRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/support', supportRoutes);
 app.use('/api/wallet/paystack', paystackRoutes);
+app.use('/api/jackpot', jackpotRoutes);
 
 // Health check endpoint
 app.get('/health', (req, res) => {

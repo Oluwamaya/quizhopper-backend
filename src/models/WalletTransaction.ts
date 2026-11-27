@@ -2,7 +2,7 @@ import { Schema, model, Document } from 'mongoose';
 
 export interface IWalletTransaction extends Document {
   user: Schema.Types.ObjectId;
-  type: 'deposit' | 'buy_coins' | 'host_game' | 'marketplace_buy' | 'marketplace_sale' | 'withdrawal' | 'signup_bonus' | 'ai_quiz_generation';
+  type: 'deposit' | 'buy_coins' | 'host_game' | 'marketplace_buy' | 'marketplace_sale' | 'withdrawal' | 'signup_bonus' | 'ai_quiz_generation' | 'jackpot_entry' | 'jackpot_refund';
   amountMoney: number; // in Naira ₦
   coinsChange: number; // e.g. +10 or -10
   description: string;
@@ -15,7 +15,7 @@ const WalletTransactionSchema = new Schema<IWalletTransaction>({
   user: { type: Schema.Types.ObjectId, ref: 'User', required: true, index: true },
   type: { 
     type: String, 
-    enum: ['deposit', 'buy_coins', 'host_game', 'marketplace_buy', 'marketplace_sale', 'withdrawal', 'signup_bonus', 'ai_quiz_generation'],
+    enum: ['deposit', 'buy_coins', 'host_game', 'marketplace_buy', 'marketplace_sale', 'withdrawal', 'signup_bonus', 'ai_quiz_generation', 'jackpot_entry', 'jackpot_refund'],
     required: true 
   },
   amountMoney: { type: Number, default: 0 },

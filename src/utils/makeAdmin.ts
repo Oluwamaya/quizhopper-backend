@@ -3,9 +3,11 @@ import { User } from '../models/User';
 import { env } from '../config/env';
 
 const makeAdmin = async () => {
-  const email = process.argv[2];
+  const args = process.argv.slice(2);
+  const promoteSuper = args.includes('--super');
+  const email = args.find((arg) => !arg.startsWith('--'));
   if (!email) {
-    console.error('Please specify an email address. Usage: npx ts-node src/utils/makeAdmin.ts <email>');
+    console.error('Usage: npx ts-node src/utils/makeAdmin.ts <email> [--super]');
     process.exit(1);
   }
 
@@ -20,10 +22,17 @@ const makeAdmin = async () => {
     }
 
     user.isAdmin = true;
+    if (promoteSuper) {
+      user.isSuperAdmin = true;
+    }
     await user.save();
 
     console.log(`\n======================================================`);
-    console.log(`SUCCESS: "${user.displayName}" (${user.email}) is now an Administrator!`);
+    console.log(
+      promoteSuper
+        ? `SUCCESS: "${user.displayName}" (${user.email}) is now a SUPER ADMINISTRATOR!`
+        : `SUCCESS: "${user.displayName}" (${user.email}) is now a Jackpot Administrator!`
+    );
     console.log(`======================================================\n`);
     
     await mongoose.disconnect();

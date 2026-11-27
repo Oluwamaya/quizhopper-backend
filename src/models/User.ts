@@ -12,11 +12,14 @@ export interface IPushSubscription {
 export interface IUser extends Document {
   displayName: string;
   email: string;
+  phone?: string;
   avatarUrl?: string;
   googleId?: string;
   password?: string; // Optional for standard Email/Password accounts
+  passwordChangedAt?: Date; // Invalidates any JWT issued prior to password change/reset
   isPremium: boolean;
   isAdmin: boolean;
+  isSuperAdmin: boolean;
   balance: number;      // Earnings from marketplace sales (in USD)
   coins: number;        // Credits to host games beyond limit
   salesCount: number;   // Total copy count of quizzes sold
@@ -36,13 +39,16 @@ const PushSubscriptionSchema = new Schema<IPushSubscription>({
 const UserSchema = new Schema<IUser>({
   displayName: { type: String, required: true, maxlength: 32 },
   email: { type: String, required: true, unique: true, maxlength: 254 },
+  phone: { type: String, trim: true, maxlength: 20 },
   avatarUrl: { type: String, maxlength: 1000 },
   googleId: { type: String, unique: true, sparse: true },
   // select: false — password hash is never returned by default; controllers
   // that need it explicitly call .select('+password').
   password: { type: String, select: false },
+  passwordChangedAt: { type: Date },
   isPremium: { type: Boolean, default: false },
   isAdmin: { type: Boolean, default: false },
+  isSuperAdmin: { type: Boolean, default: false },
   balance: { type: Number, default: 0 },
   coins: { type: Number, default: 0 },
   salesCount: { type: Number, default: 0 },

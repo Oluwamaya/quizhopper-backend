@@ -12,6 +12,8 @@ import {
   adminLogin,
   updateProfile,
   changePassword,
+  requestSetPasswordCode,
+  setPasswordWithCode,
   forgotPassword,
   resetPassword,
   buyCoins
@@ -34,7 +36,9 @@ router.post('/reset-password', authLimiter, resetPassword);
 
 // Profile & Password Update Mappings (Protected)
 router.post('/profile/update', protect, updateProfile);
-router.post('/profile/change-password', protect, changePassword);
+router.post('/profile/change-password', protect, authLimiter, changePassword);
+router.post('/profile/request-password-code', protect, authLimiter, requestSetPasswordCode);
+router.post('/profile/set-password', protect, authLimiter, setPasswordWithCode);
 router.post('/buy-coins', protect, buyCoins);
 
 // Google OAuth login start

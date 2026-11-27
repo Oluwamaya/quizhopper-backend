@@ -10,29 +10,26 @@ import {
   getAllTransactions
 } from '../controllers/adminController';
 import { protect } from '../middlewares/authMiddleware';
-import { adminProtect } from '../middlewares/adminMiddleware';
+import { adminProtect, superAdminProtect } from '../middlewares/adminMiddleware';
 
 const router = Router();
 
-// Apply auth and admin protections globally on these routes
-router.use(protect, adminProtect);
+// All admin routes require authentication
+router.use(protect);
 
-// Config endpoints
-router.get('/config', getAdminConfig);
+// Allowed for both Jackpot Admins and Super Admins
+router.get('/config', adminProtect, getAdminConfig);
+// Transactions: Super Admin sees all; Jackpot Admin is strictly scoped to jackpot_entry/jackpot_refund in controller
+router.get('/transactions', adminProtect, getAllTransactions);
+
+// Everything below is strictly Super Admin only (main engine control room)
+router.use(superAdminProtect);
+
 router.post('/config', updateAdminConfig);
-
-// Stats analytics endpoint
 router.get('/stats', getPlatformStats);
-
-// User lists and account manager endpoints
 router.get('/users', getPlatformUsers);
 router.get('/user/:id', getPlatformUserDetail);
 router.post('/user/update', updateUserStatus);
-
-// System-wide socket announcement endpoint
 router.post('/broadcast', broadcastAnnouncement);
-
-// Platform-wide wallet transaction history (paginated)
-router.get('/transactions', getAllTransactions);
 
 export default router;

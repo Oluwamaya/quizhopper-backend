@@ -1,14 +1,33 @@
 import { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
 import { env } from '../config/env';
+import { User } from '../models/User';
 
 const JWT_SECRET = env.JWT_SECRET;
 
-// Extend Request interface to include userId and userEmail
+// Extend Request interface to include userId, userEmail, and admin flags
 export interface AuthRequest extends Request {
   userId?: string;
   userEmail?: string;
+  isAdmin?: boolean;
+  isSuperAdmin?: boolean;
 }
+
+interface JwtPayload {
+  id: string;
+  email: string;
+  iat?: number;
+}
+
+// Rejects tokens issued before the user's most recent password reset/change
+// (1-second skew buffer allows the fresh token issued right after the change).
+export const isTokenRevokedByPasswordChange = async (userId: string, tokenIatSeconds?: number): Promise<boolean> => {
+  if (!tokenIatSeconds) return false;
+  const user = await User.findById(userId).select('passwordChangedAt');
+  if (!user) return true;
+  if (!user.passwordChangedAt) return false;
+  return tokenIatSeconds * 1000 < user.passwordChangedAt.getTime() - 1000;
+};
 
 // Decodes a JWT if one is present, but never rejects the request when it's
 // missing or invalid — for routes anonymous guests can also reach (the
@@ -25,9 +44,12 @@ export const optionalAuth = async (req: AuthRequest, _res: Response, next: NextF
 
   if (token) {
     try {
-      const decoded = jwt.verify(token, JWT_SECRET) as { id: string; email: string };
-      req.userId = decoded.id;
-      req.userEmail = decoded.email;
+      const decoded = jwt.verify(token, JWT_SECRET) as JwtPayload;
+      const revoked = await isTokenRevokedByPasswordChange(decoded.id, decoded.iat);
+      if (!revoked) {
+        req.userId = decoded.id;
+        req.userEmail = decoded.email;
+      }
     } catch {
       // Expired/invalid token on an otherwise-anonymous route — proceed as guest.
     }
@@ -55,7 +77,13 @@ export const protect = async (req: AuthRequest, res: Response, next: NextFunctio
 
   try {
     // Verify token
-    const decoded = jwt.verify(token, JWT_SECRET) as { id: string; email: string };
+    const decoded = jwt.verify(token, JWT_SECRET) as JwtPayload;
+
+    // Immediately invalidate tokens issued before the last password reset/change
+    const revoked = await isTokenRevokedByPasswordChange(decoded.id, decoded.iat);
+    if (revoked) {
+      return res.status(401).json({ success: false, message: 'Your password was recently changed. Please log in again.' });
+    }
     
     // Attach user credentials to request
     req.userId = decoded.id;

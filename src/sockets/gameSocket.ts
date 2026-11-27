@@ -9,7 +9,18 @@ import { setRoomCache, getRoomCache, delRoomCache, withRoomLock } from '../servi
 import { env } from '../config/env';
 import { emitAdminTransaction, emitWalletUpdate } from '../utils/adminEvents';
 import { getSafeErrorMessage } from '../middlewares/errorHandler';
+import { isTokenRevokedByPasswordChange } from '../middlewares/authMiddleware';
 import { censorMessage, validateChatMessage, isChatRateLimited, clearChatRateLimit } from '../utils/chatModeration';
+import {
+  buildRandomizedQuestions,
+  buildTop5Winners,
+  cancelAndRefundJackpotRoom,
+  emitJackpotLiveUpdate,
+  getSessionQuestions,
+  notifyJackpotWinnersByEmail,
+  rankJackpotPlayers,
+  refundSingleJackpotEntry
+} from '../services/jackpotService';
 
 const JWT_SECRET = env.JWT_SECRET;
 
@@ -102,6 +113,80 @@ export const clearRoomMemory = (gamePin: string) => {
   }
 };
 
+// Registers a newly created room (e.g. from the HTTP Jackpot controller) into
+// the live in-memory + Redis caches so host/player socket events see it right away.
+export const registerActiveRoom = async (gamePin: string, sessionObj: any, quizDoc: any) => {
+  await setRoomCache(gamePin, sessionObj);
+  activeSessions[gamePin] = sessionObj;
+  if (quizDoc) {
+    activeQuizzes[gamePin] = quizDoc;
+  }
+};
+
+// Synchronizes a player who just paid via the atomic HTTP Jackpot join route
+// into the live room cache and broadcasts lobby_update to everyone in the room.
+export const syncPaidJackpotPlayerToActiveRoom = async (
+  io: Server | undefined | null,
+  gamePin: string,
+  newPlayer: any
+) => {
+  const playersList = await withRoomLock(gamePin, async () => {
+    const session = await getActiveSession(gamePin);
+    if (!session) return null;
+
+    const alreadyPresent = session.players.some(
+      (p: any) => p.userId && newPlayer.userId && String(p.userId) === String(newPlayer.userId)
+    );
+    if (!alreadyPresent) {
+      session.players.push({
+        ...newPlayer,
+        userId: newPlayer.userId ? String(newPlayer.userId) : undefined
+      });
+      if (session.jackpot) {
+        session.jackpot.paidSeatsCount = Math.max(
+          (session.jackpot.paidSeatsCount || 0) + 1,
+          session.players.length
+        );
+      }
+      syncSession(gamePin, session);
+    }
+
+    return session.players.map((p: any) => ({
+      nickname: p.nickname,
+      avatar: p.avatar
+    }));
+  });
+
+  if (io && playersList) {
+    io.to(`room:${gamePin}`).emit('lobby_update', { players: playersList });
+  }
+};
+
+// Cleans up caches/timers and evicts all sockets from an active room.
+export const forceCloseActiveRoom = async (
+  io: Server | undefined | null,
+  gamePin: string,
+  message: string
+) => {
+  await delRoomCache(gamePin);
+  clearRoomMemory(gamePin);
+
+  if (!io) return;
+
+  io.to(`room:${gamePin}`).emit('room_closed', { message });
+
+  const roomName = `room:${gamePin}`;
+  const activeSocketsInRoom = io.sockets.adapter.rooms.get(roomName);
+  if (activeSocketsInRoom) {
+    for (const socketId of activeSocketsInRoom) {
+      const clientSocket = io.sockets.sockets.get(socketId);
+      if (clientSocket) {
+        clientSocket.leave(roomName);
+      }
+    }
+  }
+};
+
 // Socket.IO's own `.connected` flag only reflects what its heartbeat has
 // detected SO FAR — a connection that died without a clean close (phone
 // lost signal, wifi dropped) can still read as "connected" for up to the
@@ -146,13 +231,16 @@ const confirmSocketAlive = async (io: Server, socketId: string): Promise<boolean
 
 export const setupGameSockets = (io: Server) => {
   // Socket auth middleware
-  io.use((socket: AuthenticatedSocket, next) => {
+  io.use(async (socket: AuthenticatedSocket, next) => {
     const token = socket.handshake.auth?.token || socket.handshake.query?.token;
-    if (token) {
+    if (token && typeof token === 'string') {
       try {
-        const decoded = jwt.verify(token, JWT_SECRET) as { id: string; email: string };
-        socket.userId = decoded.id;
-        socket.userEmail = decoded.email;
+        const decoded = jwt.verify(token, JWT_SECRET) as { id: string; email: string; iat?: number };
+        const revoked = await isTokenRevokedByPasswordChange(decoded.id, decoded.iat);
+        if (!revoked) {
+          socket.userId = decoded.id;
+          socket.userEmail = decoded.email;
+        }
       } catch (err) {
         console.log('Socket connection without auth token validation:', socket.id);
       }
@@ -212,10 +300,10 @@ export const setupGameSockets = (io: Server) => {
 
         // Generate a unique 6-digit Game Pin
         let gamePin = Math.floor(100000 + Math.random() * 900000).toString();
-        let existingSession = await GameSession.findOne({ gamePin, state: { $ne: 'FINISHED' } });
+        let existingSession = await GameSession.findOne({ gamePin, state: { $nin: ['FINISHED', 'CANCELLED'] } });
         while (existingSession) {
           gamePin = Math.floor(100000 + Math.random() * 900000).toString();
-          existingSession = await GameSession.findOne({ gamePin, state: { $ne: 'FINISHED' } });
+          existingSession = await GameSession.findOne({ gamePin, state: { $nin: ['FINISHED', 'CANCELLED'] } });
         }
 
         // Deduct coins if cost is greater than 0. Atomic conditional update
@@ -313,19 +401,46 @@ export const setupGameSockets = (io: Server) => {
           return socket.emit('error', { message: 'Only the host can start this game' });
         }
 
+        const quiz = await Quiz.findById(session.quiz);
+        if (!quiz || quiz.questions.length === 0) {
+          return socket.emit('error', { message: 'Quiz questions not found' });
+        }
+        activeQuizzes[gamePin] = quiz;
+
+        // For Jackpot rooms, freshly randomize question and answer order at start
+        // and store it durably on the session so host, players, reconnects, and
+        // server-side grading all reference the exact same shuffled sequence.
+        if (session.isJackpot) {
+          session.randomizedQuestions = buildRandomizedQuestions(
+            quiz.questions,
+            session.jackpot?.defaultTimeLimit
+          );
+        }
+
+        const questions = getSessionQuestions(session, quiz);
+        if (questions.length === 0) {
+          return socket.emit('error', { message: 'Quiz questions not found' });
+        }
+
         // Set state to active
         session.state = 'QUESTION_ACTIVE';
         session.currentQuestionIndex = 0;
-        session.questionActiveSince = new Date();
+        session.questionActiveSince = new Date(Date.now() + 2000);
         session.backgroundMusic = backgroundMusic || 'off';
 
-        // Update database in background
-        GameSession.findByIdAndUpdate(session._id, {
+        const startUpdate: any = {
           state: 'QUESTION_ACTIVE',
           currentQuestionIndex: 0,
           questionActiveSince: session.questionActiveSince,
           backgroundMusic: session.backgroundMusic
-        }).catch(err => console.error('DB Update error:', err));
+        };
+        if (session.isJackpot && session.randomizedQuestions) {
+          startUpdate.randomizedQuestions = session.randomizedQuestions;
+        }
+
+        // Update database in background
+        GameSession.findByIdAndUpdate(session._id, startUpdate)
+          .catch(err => console.error('DB Update error:', err));
 
         // Update cache. Non-blocking: even once-per-question writes shouldn't
         // block the response on a network round-trip — measured on a 100-player
@@ -334,26 +449,32 @@ export const setupGameSockets = (io: Server) => {
         // still added a real, growing delay between questions.
         syncSession(gamePin, session);
 
-        const quiz = await Quiz.findById(session.quiz);
-        if (!quiz || quiz.questions.length === 0) {
-          return socket.emit('error', { message: 'Quiz questions not found' });
+        if (session.isJackpot) {
+          emitJackpotLiveUpdate(io);
         }
-        activeQuizzes[gamePin] = quiz;
 
-        const firstQuestion = quiz.questions[0];
+        const firstQuestion = questions[0];
 
         // Broadcast to room that the game has started
         io.to(`room:${gamePin}`).emit('game_started');
 
         // Delay emitting the first question by 2000ms to allow client-side page routing to mount GameRoom
         setTimeout(() => {
+          const liveSession = activeSessions[gamePin];
+          if (!liveSession || liveSession.state !== 'QUESTION_ACTIVE') return;
+
+          liveSession.questionActiveSince = new Date();
+          GameSession.findByIdAndUpdate(liveSession._id, {
+            questionActiveSince: liveSession.questionActiveSince
+          }).catch(err => console.error('DB Update error:', err));
+
           io.to(`room:${gamePin}`).emit('question_start', {
             questionIndex: 0,
             questionText: firstQuestion.question,
             options: firstQuestion.options,
             timeLimit: firstQuestion.timeLimit,
-            totalQuestions: quiz.questions.length,
-            backgroundMusic: session.backgroundMusic || 'off'
+            totalQuestions: questions.length,
+            backgroundMusic: liveSession.backgroundMusic || 'off'
           });
 
           // Start countdown timer
@@ -382,31 +503,11 @@ export const setupGameSockets = (io: Server) => {
         if (!quiz) return socket.emit('error', { message: 'Quiz not found' });
         activeQuizzes[gamePin] = quiz;
 
+        const questions = getSessionQuestions(session, quiz);
         const nextIndex = session.currentQuestionIndex + 1;
 
-        if (nextIndex >= quiz.questions.length) {
-          // No more questions - End the Game
-          session.state = 'FINISHED';
-          session.finishedAt = new Date();
-
-          GameSession.findByIdAndUpdate(session._id, {
-            state: 'FINISHED',
-            finishedAt: session.finishedAt
-          }).catch(err => console.error('DB Update error:', err));
-
-          await delRoomCache(gamePin);
-          clearRoomMemory(gamePin);
-
-          const finalLeaderboard = [...session.players].sort((a, b) => b.score - a.score);
-
-          io.to(`room:${gamePin}`).emit('game_over', {
-            leaderboard: finalLeaderboard.map((p, idx) => ({
-              rank: idx + 1,
-              nickname: p.nickname,
-              avatar: p.avatar,
-              score: p.score
-            }))
-          });
+        if (nextIndex >= questions.length) {
+          await finalizeGameSession(io, gamePin, session, questions);
         } else {
           // Next question exists
           session.state = 'QUESTION_ACTIVE';
@@ -425,14 +526,14 @@ export const setupGameSockets = (io: Server) => {
           // only fires once per question rather than once per player.
           syncSession(gamePin, session);
 
-          const nextQuestion = quiz.questions[nextIndex];
+          const nextQuestion = questions[nextIndex];
 
           io.to(`room:${gamePin}`).emit('question_start', {
             questionIndex: nextIndex,
             questionText: nextQuestion.question,
             options: nextQuestion.options,
             timeLimit: nextQuestion.timeLimit,
-            totalQuestions: quiz.questions.length,
+            totalQuestions: questions.length,
             backgroundMusic: session.backgroundMusic || 'off'
           });
 
@@ -448,38 +549,32 @@ export const setupGameSockets = (io: Server) => {
       try {
         const session = await GameSession.findOne({ gamePin });
         if (session) {
-          session.state = 'FINISHED';
-          session.finishedAt = new Date();
-          await session.save();
-        }
+          if (!socket.userId || session.host.toString() !== socket.userId) {
+            return socket.emit('error', { message: 'Only the host can close this room' });
+          }
 
-        // Delete cache
-        await delRoomCache(gamePin);
-        clearRoomMemory(gamePin);
+          if (session.isJackpot && session.state !== 'FINISHED' && session.state !== 'CANCELLED') {
+            const reason = session.state === 'LOBBY'
+              ? 'Cancelled by admin before start'
+              : 'Ended early by admin';
+            await cancelAndRefundJackpotRoom(io, { sessionId: String(session._id) }, reason);
+            await forceCloseActiveRoom(
+              io,
+              gamePin,
+              'This Jackpot Room was cancelled by the admin. Any entry coins have been automatically refunded to your wallet.'
+            );
+            console.log(`Admin cancelled Jackpot room:${gamePin} with automatic refunds`);
+            return;
+          }
 
-        // Notify all clients in the room that the room is closed
-        io.to(`room:${gamePin}`).emit('room_closed', {
-          message: 'The host has ended this game session.'
-        });
-
-        // Let all sockets leave the room
-        const roomName = `room:${gamePin}`;
-        const activeSocketsInRoom = io.sockets.adapter.rooms.get(roomName);
-        if (activeSocketsInRoom) {
-          for (const socketId of activeSocketsInRoom) {
-            const clientSocket = io.sockets.sockets.get(socketId);
-            if (clientSocket) {
-              clientSocket.leave(roomName);
-            }
+          if (!session.isJackpot && session.state !== 'FINISHED') {
+            session.state = 'FINISHED';
+            session.finishedAt = new Date();
+            await session.save();
           }
         }
 
-        // Delete active timer
-        if (activeTimers[gamePin]) {
-          clearTimeout(activeTimers[gamePin]);
-          delete activeTimers[gamePin];
-        }
-
+        await forceCloseActiveRoom(io, gamePin, 'The host has ended this game session.');
         console.log(`Host aborted room:${gamePin}`);
       } catch (err: any) {
         emitSocketError(socket, err, 'host_close_room');
@@ -531,6 +626,46 @@ export const setupGameSockets = (io: Server) => {
 
           if (!session) {
             return { status: 'error' as const, message: 'Active game lobby not found. Check the Game Pin.' };
+          }
+
+          // Jackpot rooms require atomic coin payment via POST /api/jackpot/:id/join.
+          // Block unpaid / anonymous PIN joins; allow already-paid authenticated
+          // players to bind their socket and enter cleanly.
+          if (session.isJackpot) {
+            if (!socket.userId) {
+              return { status: 'join_failed' as const, message: 'Please sign in and join this Jackpot Room from the Jackpot Live card.' };
+            }
+            const paidPlayer = session.players.find(
+              (p: any) => p.userId && String(p.userId) === String(socket.userId)
+            );
+            if (!paidPlayer) {
+              return { status: 'join_failed' as const, message: 'Entry payment is required. Join this room from the Jackpot Live card.' };
+            }
+
+            if (paidPlayer.socketId && paidPlayer.socketId !== socket.id) {
+              const currentSocket = io.sockets.sockets.get(paidPlayer.socketId);
+              if (currentSocket && currentSocket.connected) {
+                return { status: 'join_failed' as const, message: 'You are already connected to this Jackpot Room in another tab.' };
+              }
+            }
+
+            paidPlayer.socketId = socket.id;
+            GameSession.updateOne(
+              { _id: session._id, 'players.userId': socket.userId },
+              { $set: { 'players.$.socketId': socket.id } }
+            ).catch((err: any) => console.error('DB Jackpot Bind Socket error:', err));
+            syncSession(gamePin, session);
+
+            if (session.state === 'LOBBY') {
+              return {
+                status: 'ok' as const,
+                newPlayer: paidPlayer,
+                players: session.players,
+                chatEnabled: session.chatEnabled !== false,
+                chatMessages: session.chatMessages || []
+              };
+            }
+            return { status: 'rejoined' as const, session };
           }
 
           // A matching nickname already in this room means this is the same
@@ -695,13 +830,38 @@ export const setupGameSockets = (io: Server) => {
             { $pull: { players: { nickname } } }
           ).catch((err: any) => console.error('DB Update error:', err));
 
+          if (session.isJackpot && session.jackpot && session.jackpot.paidSeatsCount > 0) {
+            session.jackpot.paidSeatsCount = Math.max(0, session.jackpot.paidSeatsCount - 1);
+          }
+
           syncSession(gamePin, session);
 
-          return { status: 'ok' as const, removedPlayer, players: session.players };
+          return {
+            status: 'ok' as const,
+            removedPlayer,
+            players: session.players,
+            isJackpot: !!session.isJackpot,
+            sessionId: String(session._id),
+            jackpotTitle: session.jackpot?.title || 'Jackpot Room'
+          };
         });
 
         if (result.status === 'error') {
           return socket.emit('error', { message: result.message });
+        }
+
+        // If this was a Jackpot Room, automatically refund the removed player's coins
+        let refundedCoins = 0;
+        if (result.isJackpot && result.removedPlayer.userId) {
+          const refundRes = await refundSingleJackpotEntry(
+            io,
+            result.sessionId,
+            String(result.removedPlayer.userId),
+            result.jackpotTitle,
+            'Removed from lobby by admin'
+          );
+          refundedCoins = refundRes.coinsRefunded;
+          emitJackpotLiveUpdate(io);
         }
 
         // Disconnect the removed player's own socket from the room and notify them
@@ -709,7 +869,11 @@ export const setupGameSockets = (io: Server) => {
         if (removedSocketId) {
           const removedSocket = io.sockets.sockets.get(removedSocketId);
           if (removedSocket) {
-            removedSocket.emit('removed_from_game', { message: 'The host has removed you from this game session.' });
+            removedSocket.emit('removed_from_game', {
+              message: refundedCoins > 0
+                ? `The admin removed you from this Jackpot Room. Your ${refundedCoins} coins have been refunded.`
+                : 'The host has removed you from this game session.'
+            });
             removedSocket.leave(`room:${gamePin}`);
           }
         }
@@ -859,43 +1023,66 @@ export const setupGameSockets = (io: Server) => {
         quiz = await Quiz.findById(session.quiz);
         if (quiz) activeQuizzes[gamePin] = quiz;
       }
+      const questions = getSessionQuestions(session, quiz);
       let activeQuestionData = null;
       let secondsRemaining = 0;
 
-      if (session.state === 'QUESTION_ACTIVE' && quiz) {
-        const currentQuestion = quiz.questions[session.currentQuestionIndex];
-        const timePassedMs = new Date().getTime() - new Date(session.questionActiveSince).getTime();
-        secondsRemaining = Math.max(0, currentQuestion.timeLimit - Math.floor(timePassedMs / 1000));
-        activeQuestionData = {
-          questionIndex: session.currentQuestionIndex,
-          questionText: currentQuestion.question,
-          options: currentQuestion.options,
-          timeLimit: currentQuestion.timeLimit,
-          totalQuestions: quiz.questions.length
-        };
+      if (session.state === 'QUESTION_ACTIVE' && questions.length > 0) {
+        const currentQuestion = questions[session.currentQuestionIndex];
+        if (currentQuestion) {
+          const timePassedMs = Math.max(0, new Date().getTime() - new Date(session.questionActiveSince).getTime());
+          secondsRemaining = Math.max(0, currentQuestion.timeLimit - Math.floor(timePassedMs / 1000));
+          activeQuestionData = {
+            questionIndex: session.currentQuestionIndex,
+            questionText: currentQuestion.question,
+            options: currentQuestion.options,
+            timeLimit: currentQuestion.timeLimit,
+            totalQuestions: questions.length
+          };
+        }
       }
 
-      const currentLeaderboard = [...session.players].sort((a, b) => b.score - a.score);
-      const mappedLeaderboard = currentLeaderboard.map((p: any, idx) => ({
-        rank: idx + 1,
-        nickname: p.nickname,
-        avatar: p.avatar,
-        score: p.score,
-        isCorrect: p.answers.find((ans: any) => ans.questionIndex === session.currentQuestionIndex)?.isCorrect || false
-      }));
+      const mappedLeaderboard = session.isJackpot
+        ? rankJackpotPlayers(session.players, questions).map((entry, idx) => ({
+            rank: idx + 1,
+            nickname: entry.player.nickname,
+            avatar: entry.player.avatar,
+            score: entry.score,
+            totalAnswerTimeMs: entry.totalAnswerTimeMs,
+            finishedAt: entry.finishedAt,
+            isCorrect: entry.player.answers.find((ans: any) => ans.questionIndex === session.currentQuestionIndex)?.isCorrect || false
+          }))
+        : [...session.players].sort((a, b) => b.score - a.score).map((p: any, idx) => ({
+            rank: idx + 1,
+            nickname: p.nickname,
+            avatar: p.avatar,
+            score: p.score,
+            isCorrect: p.answers.find((ans: any) => ans.questionIndex === session.currentQuestionIndex)?.isCorrect || false
+          }));
 
       return {
         state: session.state,
         currentQuestionIndex: session.currentQuestionIndex,
         secondsRemaining,
-        totalQuestions: quiz ? quiz.questions.length : 0,
-        quizTitle: quiz ? quiz.title : '',
+        totalQuestions: questions.length,
+        quizTitle: session.isJackpot ? (session.jackpot?.title || quiz?.title || '') : (quiz ? quiz.title : ''),
+        playerLimit: session.playerLimit || 10,
         lobbyMusic: session.lobbyMusic || 'off',
         players: session.players.map((p: any) => ({ nickname: p.nickname, avatar: p.avatar, mutedInChat: !!p.mutedInChat })),
         activeQuestion: activeQuestionData,
         leaderboard: mappedLeaderboard,
         chatEnabled: session.chatEnabled !== false,
-        chatMessages: session.chatMessages || []
+        chatMessages: session.chatMessages || [],
+        isJackpot: !!session.isJackpot,
+        jackpot: session.isJackpot && session.jackpot
+          ? {
+              id: String(session._id),
+              title: session.jackpot.title,
+              prizeLabel: session.jackpot.prizeLabel,
+              entryCostCoins: session.jackpot.entryCostCoins,
+              playerLimit: session.playerLimit
+            }
+          : null
       };
     };
 
@@ -926,9 +1113,11 @@ export const setupGameSockets = (io: Server) => {
         // withRoomLock.
         const peekSession = activeSessions[gamePin];
         if (peekSession) {
-          const trimmedNickname = nickname.toLowerCase().trim();
-          const peekMatch = peekSession.players.find((p: any) => p.nickname.toLowerCase() === trimmedNickname);
-          if (peekMatch) {
+          const trimmedNickname = (nickname || '').toLowerCase().trim();
+          const peekMatch = peekSession.isJackpot && socket.userId
+            ? peekSession.players.find((p: any) => p.userId && String(p.userId) === String(socket.userId))
+            : peekSession.players.find((p: any) => p.nickname.toLowerCase() === trimmedNickname);
+          if (peekMatch && peekMatch.socketId && peekMatch.socketId !== socket.id) {
             const stillAlive = await confirmSocketAlive(io, peekMatch.socketId);
             if (stillAlive) return; // same as today: a live nickname collision is treated as "not found"
           }
@@ -938,18 +1127,33 @@ export const setupGameSockets = (io: Server) => {
           const session = await getActiveSession(gamePin);
           if (!session) return null;
 
-          const match = session.players.find((p: any) => p.nickname.toLowerCase() === nickname.toLowerCase().trim());
+          let match: any = null;
+          if (session.isJackpot) {
+            // Jackpot seats are strictly bound to authenticated userId — prevents seat hijacking
+            if (!socket.userId) return null;
+            match = session.players.find(
+              (p: any) => p.userId && String(p.userId) === String(socket.userId)
+            );
+          } else {
+            match = session.players.find((p: any) => p.nickname.toLowerCase() === (nickname || '').toLowerCase().trim());
+          }
           if (!match) return null;
 
           // Same hijack guard as player_join_lobby: never let a nickname be
           // reclaimed while that player's own connection is still live.
-          const currentSocket = io.sockets.sockets.get(match.socketId);
-          if (currentSocket && currentSocket.connected) return null;
+          if (match.socketId && match.socketId !== socket.id) {
+            const currentSocket = io.sockets.sockets.get(match.socketId);
+            if (currentSocket && currentSocket.connected) return null;
+          }
 
           match.socketId = socket.id;
 
+          const updateQuery = session.isJackpot && match.userId
+            ? { _id: session._id, 'players.userId': match.userId }
+            : { _id: session._id, 'players.nickname': match.nickname };
+
           GameSession.updateOne(
-            { _id: session._id, 'players.nickname': match.nickname },
+            updateQuery,
             { $set: { 'players.$.socketId': socket.id } }
           ).catch(err => console.error('DB Rejoin Update error:', err));
 
@@ -999,7 +1203,9 @@ export const setupGameSockets = (io: Server) => {
             return { status: 'error' as const, message: 'Game is not accepting answers right now' };
           }
 
-          const player = session.players.find((p: any) => p.socketId === socket.id);
+          const player = session.isJackpot && socket.userId
+            ? session.players.find((p: any) => p.socketId === socket.id && String(p.userId) === String(socket.userId))
+            : session.players.find((p: any) => p.socketId === socket.id);
           if (!player) {
             return { status: 'error' as const, message: 'Player record not found in session' };
           }
@@ -1015,17 +1221,34 @@ export const setupGameSockets = (io: Server) => {
           // answer burst. Fall back to a fresh fetch only if the cache was never
           // populated (e.g. server restarted mid-game).
           let quiz = activeQuizzes[gamePin];
-          if (!quiz) {
+          if (!quiz && !session.randomizedQuestions?.length) {
             quiz = await Quiz.findById(session.quiz);
             if (!quiz) return { status: 'error' as const, message: 'Quiz not found' };
             activeQuizzes[gamePin] = quiz;
           }
 
-          const currentQuestion = quiz.questions[session.currentQuestionIndex];
-          const isCorrect = (selectedAnswer === currentQuestion.correctOption);
+          const questions = getSessionQuestions(session, quiz);
+          const currentQuestion = questions[session.currentQuestionIndex];
+          if (!currentQuestion) {
+            return { status: 'error' as const, message: 'Active question not found' };
+          }
 
-          const timeTakenMs = new Date().getTime() - new Date(session.questionActiveSince).getTime();
+          // Server-side validation: answer must be one of the question's actual options
+          if (typeof selectedAnswer !== 'string' || !currentQuestion.options.includes(selectedAnswer)) {
+            return { status: 'error' as const, message: 'Invalid answer option selected' };
+          }
+
+          const now = new Date();
+          const rawTimeTakenMs = now.getTime() - new Date(session.questionActiveSince).getTime();
           const timeLimitMs = currentQuestion.timeLimit * 1000;
+
+          // Server-side timer validation (small 750ms grace for network latency)
+          if (rawTimeTakenMs > timeLimitMs + 750) {
+            return { status: 'error' as const, message: 'Time is up for this question' };
+          }
+
+          const timeTakenMs = Math.max(0, Math.min(rawTimeTakenMs, timeLimitMs));
+          const isCorrect = (selectedAnswer === currentQuestion.correctOption);
 
           let scoreAwarded = 0;
           if (isCorrect) {
@@ -1039,17 +1262,27 @@ export const setupGameSockets = (io: Server) => {
             isCorrect,
             scoreAwarded,
             timeTakenMs,
-            submittedAt: new Date()
+            submittedAt: now
           };
 
           player.answers.push(answerLog);
           player.score += scoreAwarded;
+          player.totalAnswerTimeMs = (player.totalAnswerTimeMs || 0) + timeTakenMs;
+          player.lastAnswerAt = now;
+
+          const playerMatchQuery = session.isJackpot && player.userId
+            ? { _id: session._id, 'players.userId': player.userId }
+            : { _id: session._id, 'players.socketId': socket.id };
 
           GameSession.updateOne(
-            { _id: session._id, 'players.socketId': socket.id },
+            playerMatchQuery,
             {
               $push: { 'players.$.answers': answerLog },
-              $inc: { 'players.$.score': scoreAwarded }
+              $inc: {
+                'players.$.score': scoreAwarded,
+                'players.$.totalAnswerTimeMs': timeTakenMs
+              },
+              $set: { 'players.$.lastAnswerAt': now }
             }
           ).catch(err => console.error('DB Update error:', err));
 
@@ -1119,6 +1352,105 @@ const startCountdown = (io: Server, gamePin: string, durationSeconds: number) =>
   activeTimers[gamePin] = setTimeout(tick, 1000);
 };
 
+// Shared game completion helper for both endQuestion (last question) and
+// host_next_question. For Jackpot rooms, computes tie-broken Top 5 winners,
+// persists them durably, broadcasts public winners to the room, and sends
+// the full payout contact list (name/email/phone) privately to the admin host.
+const finalizeGameSession = async (io: Server, gamePin: string, session: any, questions: any[]) => {
+  session.state = 'FINISHED';
+  session.finishedAt = new Date();
+
+  if (session.isJackpot) {
+    const ranked = rankJackpotPlayers(session.players || [], questions);
+    const winners = await buildTop5Winners(session, questions);
+
+    await GameSession.findByIdAndUpdate(session._id, {
+      $set: {
+        state: 'FINISHED',
+        finishedAt: session.finishedAt,
+        'jackpot.winners': winners
+      }
+    }).catch(err => console.error('DB Jackpot Finalize error:', err));
+
+    await delRoomCache(gamePin);
+    clearRoomMemory(gamePin);
+
+    const publicLeaderboard = ranked.map((entry, idx) => ({
+      rank: idx + 1,
+      nickname: entry.player.nickname,
+      avatar: entry.player.avatar,
+      score: entry.score,
+      totalAnswerTimeMs: entry.totalAnswerTimeMs,
+      finishedAt: entry.finishedAt
+    }));
+
+    const publicWinners = winners.map((w) => ({
+      rank: w.rank,
+      nickname: w.nickname,
+      avatar: w.avatar,
+      score: w.score,
+      totalAnswerTimeMs: w.totalAnswerTimeMs,
+      finishedAt: w.finishedAt
+    }));
+
+    io.to(`room:${gamePin}`).emit('game_over', {
+      isJackpot: true,
+      jackpot: session.jackpot
+        ? {
+            id: String(session._id),
+            title: session.jackpot.title,
+            prizeLabel: session.jackpot.prizeLabel,
+            entryCostCoins: session.jackpot.entryCostCoins
+          }
+        : null,
+      winners: publicWinners,
+      leaderboard: publicLeaderboard
+    });
+
+    // Send full Top 5 payout contacts (name, email, phone) to the hosting
+    // Jackpot Admin / Super Admin so they can call & pay the winners immediately.
+    const hostDoc = await User.findById(session.host).select('isAdmin isSuperAdmin');
+    if (hostDoc?.isAdmin || hostDoc?.isSuperAdmin) {
+      io.to(`user:${String(session.host)}`).emit('jackpot_admin_winners', {
+        sessionId: String(session._id),
+        gamePin,
+        title: session.jackpot?.title || '',
+        prizeLabel: session.jackpot?.prizeLabel || '',
+        winners
+      });
+    }
+
+    // Notify Top 5 winners via ZeptoMail asynchronously (non-blocking)
+    notifyJackpotWinnersByEmail(
+      session.jackpot?.title || 'Jackpot Room',
+      session.jackpot?.prizeLabel || 'Jackpot Prize',
+      winners
+    );
+
+    emitJackpotLiveUpdate(io);
+    return;
+  }
+
+  GameSession.findByIdAndUpdate(session._id, {
+    state: 'FINISHED',
+    finishedAt: session.finishedAt
+  }).catch(err => console.error('DB Update error:', err));
+
+  await delRoomCache(gamePin);
+  clearRoomMemory(gamePin);
+
+  const finalLeaderboard = [...session.players].sort((a, b) => b.score - a.score);
+
+  io.to(`room:${gamePin}`).emit('game_over', {
+    leaderboard: finalLeaderboard.map((p, idx) => ({
+      rank: idx + 1,
+      nickname: p.nickname,
+      avatar: p.avatar,
+      score: p.score
+    }))
+  });
+};
+
 const endQuestion = async (io: Server, gamePin: string) => {
   delete activeTimers[gamePin];
 
@@ -1134,37 +1466,20 @@ const endQuestion = async (io: Server, gamePin: string) => {
       if (!session || session.state !== 'QUESTION_ACTIVE') return;
 
       let quiz = activeQuizzes[gamePin];
-      if (!quiz) {
+      if (!quiz && !session.randomizedQuestions?.length) {
         quiz = await Quiz.findById(session.quiz);
         if (!quiz) return;
         activeQuizzes[gamePin] = quiz;
       }
 
-      const currentQuestion = quiz.questions[session.currentQuestionIndex];
-      const isLastQuestion = (session.currentQuestionIndex + 1 >= quiz.questions.length);
+      const questions = getSessionQuestions(session, quiz);
+      const currentQuestion = questions[session.currentQuestionIndex];
+      if (!currentQuestion) return;
+
+      const isLastQuestion = (session.currentQuestionIndex + 1 >= questions.length);
 
       if (isLastQuestion) {
-        session.state = 'FINISHED';
-        session.finishedAt = new Date();
-
-        GameSession.findByIdAndUpdate(session._id, {
-          state: 'FINISHED',
-          finishedAt: session.finishedAt
-        }).catch(err => console.error('DB Update error:', err));
-
-        await delRoomCache(gamePin);
-        clearRoomMemory(gamePin);
-
-        const finalLeaderboard = [...session.players].sort((a, b) => b.score - a.score);
-
-        io.to(`room:${gamePin}`).emit('game_over', {
-          leaderboard: finalLeaderboard.map((p, idx) => ({
-            rank: idx + 1,
-            nickname: p.nickname,
-            avatar: p.avatar,
-            score: p.score
-          }))
-        });
+        await finalizeGameSession(io, gamePin, session, questions);
       } else {
         session.state = 'SCOREBOARD';
 
@@ -1174,17 +1489,26 @@ const endQuestion = async (io: Server, gamePin: string) => {
         // Update cache
         syncSession(gamePin, session);
 
-        const currentLeaderboard = [...session.players].sort((a, b) => b.score - a.score);
+        const leaderboardPayload = session.isJackpot
+          ? rankJackpotPlayers(session.players, questions).map((entry, idx) => ({
+              rank: idx + 1,
+              nickname: entry.player.nickname,
+              avatar: entry.player.avatar,
+              score: entry.score,
+              totalAnswerTimeMs: entry.totalAnswerTimeMs,
+              isCorrect: entry.player.answers.find((ans: any) => ans.questionIndex === session.currentQuestionIndex)?.isCorrect || false
+            }))
+          : [...session.players].sort((a, b) => b.score - a.score).map((p: any, idx) => ({
+              rank: idx + 1,
+              nickname: p.nickname,
+              avatar: p.avatar,
+              score: p.score,
+              isCorrect: p.answers.find((ans: any) => ans.questionIndex === session.currentQuestionIndex)?.isCorrect || false
+            }));
 
         io.to(`room:${gamePin}`).emit('question_ended', {
           correctOption: currentQuestion.correctOption,
-          leaderboard: currentLeaderboard.map((p: any, idx) => ({
-            rank: idx + 1,
-            nickname: p.nickname,
-            avatar: p.avatar,
-            score: p.score,
-            isCorrect: p.answers.find((ans: any) => ans.questionIndex === session.currentQuestionIndex)?.isCorrect || false
-          }))
+          leaderboard: leaderboardPayload
         });
       }
     });

@@ -95,5 +95,13 @@ export const env = {
 
   // Anthropic (Claude) API for AI quiz generation. Optional — the feature
   // returns a 503 if this isn't set rather than failing the whole app at boot.
-  ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY || ''
+  ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY || '',
+
+  // ZeptoMail transactional email API (password resets, verification codes,
+  // Jackpot winner & refund notifications). Optional — falls back to server
+  // console logs in development when unset.
+  ZEPTO_MAIL_API_KEY: process.env.ZEPTO_MAIL_API_KEY || '',
+  ZEPTO_MAIL_API_URL: process.env.ZEPTO_MAIL_API_URL || 'https://api.zeptomail.com/v1.1/email',
+  ZEPTO_MAIL_FROM_EMAIL: process.env.ZEPTO_MAIL_FROM_EMAIL || 'noreply@quizhopper.online',
+  ZEPTO_MAIL_FROM_NAME: process.env.ZEPTO_MAIL_FROM_NAME || 'Quiz Hopper'
 };

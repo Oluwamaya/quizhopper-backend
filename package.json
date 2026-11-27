@@ -11,7 +11,8 @@
     "build": "tsc",
     "start": "node dist/app.js",
     "seed": "ts-node src/utils/seed.ts",
-    "make-admin": "ts-node src/utils/makeAdmin.ts"
+    "make-admin": "ts-node src/utils/makeAdmin.ts",
+    "make-super-admin": "ts-node src/utils/makeAdmin.ts --super"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.123.0",

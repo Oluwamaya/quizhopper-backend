@@ -4,7 +4,7 @@ import crypto from 'crypto';
 import { SupportTicket } from '../models/SupportTicket';
 import { User } from '../models/User';
 import { protect, optionalAuth, AuthRequest } from '../middlewares/authMiddleware';
-import { adminProtect } from '../middlewares/adminMiddleware';
+import { superAdminProtect } from '../middlewares/adminMiddleware';
 import { uploadLimiter } from '../middlewares/rateLimiters';
 import { isStorageConfigured, uploadToStorage } from '../services/storageService';
 import { sendServerError } from '../middlewares/errorHandler';
@@ -173,7 +173,7 @@ router.post('/upload', uploadLimiter, async (req: AuthRequest, res: Response) =>
 // with dozens of long-running conversations the full thread history would
 // make this payload unnecessarily heavy. The full thread is fetched
 // separately via GET /ticket/:guestId when an admin opens one.
-router.get('/tickets', protect, adminProtect, async (req: AuthRequest, res: Response) => {
+router.get('/tickets', protect, superAdminProtect, async (req: AuthRequest, res: Response) => {
   try {
     const page = Math.max(1, parseInt(req.query.page as string, 10) || 1);
     const limit = Math.min(50, Math.max(1, parseInt(req.query.limit as string, 10) || 20));
@@ -215,7 +215,7 @@ router.get('/tickets', protect, adminProtect, async (req: AuthRequest, res: Resp
 });
 
 // 4. Admin-only: Close support ticket case
-router.post('/ticket/:guestId/close', protect, adminProtect, async (req: AuthRequest, res: Response) => {
+router.post('/ticket/:guestId/close', protect, superAdminProtect, async (req: AuthRequest, res: Response) => {
   const { guestId } = req.params;
   try {
     const ticket = await SupportTicket.findOneAndUpdate(
@@ -235,7 +235,7 @@ router.post('/ticket/:guestId/close', protect, adminProtect, async (req: AuthReq
 // 5. Admin-only: Delete a single ticket permanently. Only resolved/closed
 // tickets may be deleted — an open ticket may still need a reply, and
 // deleting it would silently drop an unresolved complaint.
-router.delete('/ticket/:guestId', protect, adminProtect, async (req: AuthRequest, res: Response) => {
+router.delete('/ticket/:guestId', protect, superAdminProtect, async (req: AuthRequest, res: Response) => {
   const { guestId } = req.params;
   if (!GUEST_ID_PATTERN.test(guestId)) {
     return res.status(400).json({ success: false, message: 'Invalid guest session identifier' });
@@ -262,7 +262,7 @@ router.delete('/ticket/:guestId', protect, adminProtect, async (req: AuthRequest
 // list are silently skipped rather than rejecting the whole batch, since the
 // client already excludes open tickets from selection; this is the
 // server-side backstop against a direct API call bypassing that.
-router.post('/tickets/bulk-delete', protect, adminProtect, async (req: AuthRequest, res: Response) => {
+router.post('/tickets/bulk-delete', protect, superAdminProtect, async (req: AuthRequest, res: Response) => {
   const { guestIds } = req.body;
   if (!Array.isArray(guestIds) || guestIds.length === 0 || guestIds.length > 200) {
     return res.status(400).json({ success: false, message: 'guestIds must be a non-empty array of up to 200 ids' });

@@ -16,8 +16,15 @@ const router = Router();
 // Retrieve all quizzes in user's library (Defaults + Created + Purchased)
 router.get('/library', protect, getUserLibrary);
 
+const MARKETPLACE_ENABLED = false;
+
 // Retrieve all quizzes listed on the marketplace
-router.get('/marketplace', protect, getMarketplaceQuizzes);
+router.get('/marketplace', protect, (req, res, next) => {
+  if (!MARKETPLACE_ENABLED) {
+    return res.status(404).json({ success: false, message: 'Quiz Marketplace is currently unavailable' });
+  }
+  next();
+}, getMarketplaceQuizzes);
 
 // Generate a set of quiz questions with AI (coins charged, nothing saved
 // until the user reviews and submits via the normal create endpoint)

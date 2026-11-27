@@ -3,6 +3,7 @@ import { GameSession } from '../models/GameSession';
 import { AuthRequest } from '../middlewares/authMiddleware';
 import { getGlobalConfig } from '../models/AppConfig';
 import { sendServerError } from '../middlewares/errorHandler';
+import { getSessionQuestions, rankJackpotPlayers } from '../services/jackpotService';
 
 // Retrieve current platform pricing: hosting capacity costs and the coin exchange rate
 export const getHostingPricing = async (req: AuthRequest, res: Response) => {
@@ -39,14 +40,19 @@ export const getGameHistory = async (req: AuthRequest, res: Response) => {
       .limit(limit);
 
     const formattedHistory = sessions.map((session: any) => {
-      // Sort players by score in descending order
-      const rankedPlayers = [...session.players].sort((a, b) => b.score - a.score);
+      const questions = getSessionQuestions(session, session.quiz);
+      const rankedPlayers = session.isJackpot
+        ? rankJackpotPlayers(session.players, questions).map((entry) => entry.player)
+        : [...session.players].sort((a, b) => b.score - a.score);
 
       return {
         id: session._id,
         gamePin: session.gamePin,
-        quizTitle: session.quiz ? session.quiz.title : 'Deleted Quiz',
-        totalQuestions: session.quiz && session.quiz.questions ? session.quiz.questions.length : 0,
+        quizTitle: session.isJackpot
+          ? `${session.jackpot?.title || 'Jackpot Room'} (Jackpot)`
+          : (session.quiz ? session.quiz.title : 'Deleted Quiz'),
+        isJackpot: !!session.isJackpot,
+        totalQuestions: questions.length,
         playerCount: session.players.length,
         players: rankedPlayers.map((player, index) => ({
           rank: index + 1,

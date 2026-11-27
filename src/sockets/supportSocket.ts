@@ -17,8 +17,8 @@ const MAX_MESSAGE_LENGTH = 2000;
 // fires.
 const isRequestingSocketAnAdmin = async (socket: AuthenticatedSocket): Promise<boolean> => {
   if (!socket.userId) return false;
-  const user = await User.findById(socket.userId);
-  return !!user?.isAdmin;
+  const user = await User.findById(socket.userId).select('isSuperAdmin');
+  return !!user?.isSuperAdmin;
 };
 
 // A logged-in visitor's ticket identity is always their account, never
