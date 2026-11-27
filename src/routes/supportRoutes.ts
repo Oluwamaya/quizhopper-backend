@@ -72,7 +72,7 @@ router.get('/ticket/:guestId', optionalAuth, async (req: AuthRequest, res: Respo
         email: accountEmail || rawEmail || undefined,
         messages: [{
           sender: 'admin',
-          text: `Hello ${displayName}! Welcome to Mayacode Technologies live support. Please type your complaint or upload your payment screenshots below.`,
+          text: `Hello ${displayName}! Welcome to QuizHopper live support. Please type your complaint or upload your payment screenshots below.`,
           createdAt: new Date()
         }],
         status: 'open'
